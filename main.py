@@ -20,6 +20,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 LINE_API = "https://api.line.me/v2/bot"
+LINE_DATA_API = "https://api-data.line.me/v2/bot"
 CLAUDE_API = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
@@ -65,7 +66,7 @@ async def push_message(user_id: str, messages: list):
 async def get_image_content(message_id: str) -> bytes:
     async with httpx.AsyncClient(timeout=30.0) as client:
         res = await client.get(
-            f"{LINE_API}/message/{message_id}/content",
+            f"{LINE_DATA_API}/message/{message_id}/content",
             headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
         )
         content = res.content
@@ -192,73 +193,3 @@ def format_ads_for_line(ads: dict) -> list:
 
 async def process_image(user_id: str, message_id: str):
     try:
-        await asyncio.sleep(3)  # LINEの画像準備を待つ
-        image_bytes = await get_image_content(message_id)
-        print(f"Image size: {len(image_bytes)} bytes")
-
-        car_info = await extract_car_info(image_bytes)
-        print(f"Car info extracted: {car_info[:100]}")
-
-        await push_message(user_id, [{
-            "type": "text",
-            "text": f"✅ 解析完了！\n\n【車情報（仕入先・価格除外済み）】\n{car_info}\n\n📝 広告文を生成中..."
-        }])
-
-        ads = await generate_ads(car_info)
-        ad_messages = format_ads_for_line(ads)
-
-        await push_message(user_id, [{
-            "type": "text",
-            "text": "🎉 広告文生成完了！\n中国語・英語・ロシア語 × 5SNS = 15種類"
-        }])
-
-        for i in range(0, len(ad_messages), 5):
-            await push_message(user_id, ad_messages[i:i+5])
-
-        await push_message(user_id, [{
-            "type": "text",
-            "text": "✨ 完了！各SNSにコピー＆ペーストしてご使用ください。\n\n次の車の写真を送ってください 🚗"
-        }])
-
-    except Exception as e:
-        print(f"Error in process_image: {e}")
-        await push_message(user_id, [{
-            "type": "text",
-            "text": f"❌ エラーが発生しました。\n{str(e)}\n\n写真を再送してください。"
-        }])
-
-@app.post("/webhook")
-async def webhook(request: Request, background_tasks: BackgroundTasks):
-    body = await request.body()
-    signature = request.headers.get("X-Line-Signature", "")
-
-    if not verify_signature(body, signature):
-        raise HTTPException(status_code=400, detail="Invalid signature")
-
-    data = json.loads(body)
-    print(f"Webhook received: {json.dumps(data)[:200]}")
-
-    for event in data.get("events", []):
-        event_type = event.get("type")
-        reply_token = event.get("replyToken")
-        user_id = event.get("source", {}).get("userId")
-
-        if event_type == "message" and event.get("message", {}).get("type") == "image":
-            message_id = event["message"]["id"]
-            await reply_message(reply_token, [{
-                "type": "text",
-                "text": "📋 オークションシートを受信しました！\n\n🔍 車情報を解析中...\n⏳ 少々お待ちください（約30秒）"
-            }])
-            background_tasks.add_task(process_image, user_id, message_id)
-
-        elif event_type == "message" and event.get("message", {}).get("type") == "text":
-            await reply_message(reply_token, [{
-                "type": "text",
-                "text": "🚗 AUTO AD GENERATOR\n\nオークションシートの写真を送ってください！\n自動で以下を生成します：\n\n🇨🇳 中国語\n🇬🇧 English\n🇷🇺 Русский\n\n× X / Facebook / TikTok / 小紅書 / Instagram\n\n= 15種類の広告文を自動生成！\n※仕入先・価格は自動で除外されます"
-            }])
-
-    return JSONResponse(content={"status": "ok"})
-
-@app.get("/")
-async def health():
-    return {"status": "running", "service": "LINE Car Ad Generator Bot (Claude API)"}
