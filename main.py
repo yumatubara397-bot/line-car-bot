@@ -68,7 +68,11 @@ async def get_image_content(message_id: str) -> bytes:
             f"{LINE_API}/message/{message_id}/content",
             headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
         )
-        return res.content
+        content = res.content
+        if not content or len(content) == 0:
+            raise Exception(f"画像データが空です。LINEからの取得に失敗しました。status: {res.status_code}")
+        print(f"Image fetched: {len(content)} bytes, status: {res.status_code}")
+        return content
 
 async def call_claude_vision(image_bytes: bytes, prompt: str) -> str:
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
