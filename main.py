@@ -1,14 +1,14 @@
 """
 LINE Bot - 車オークションシート自動広告生成
 Google Gemini API（無料）使用
-写真を送るだけで、中国語・英語・ロシア語 × 5SNS の広告文を自動生成
 """
 
 import os
 import json
 import base64
+import asyncio
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 import hashlib
 import hmac
@@ -37,27 +37,28 @@ def get_line_headers():
     }
 
 async def reply_message(reply_token: str, messages: list):
-    async with httpx.AsyncClient() as client:
-        await client.post(
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
             f"{LINE_API}/message/reply",
             headers=get_line_headers(),
             json={"replyToken": reply_token, "messages": messages}
         )
+        print(f"reply_message status: {r.status_code} {r.text}")
 
 async def push_message(user_id: str, messages: list):
-    async with httpx.AsyncClient() as client:
-        await client.post(
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
             f"{LINE_API}/message/push",
             headers=get_line_headers(),
             json={"to": user_id, "messages": messages}
         )
+        print(f"push_message status: {r.status_code} {r.text}")
 
 async def get_image_content(message_id: str) -> bytes:
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         res = await client.get(
             f"{LINE_API}/message/{message_id}/content",
             headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
-            timeout=30.0
         )
         return res.content
 
@@ -75,6 +76,7 @@ async def call_gemini(contents: list, max_tokens: int = 4000) -> str:
             }
         )
         data = res.json()
+        print(f"Gemini response: {json.dumps(data)[:500]}")
         if "error" in data:
             raise Exception(data["error"]["message"])
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -149,14 +151,57 @@ def format_ads_for_line(ads: dict) -> list:
         messages.append({"type": "text", "text": text.strip()})
     return messages
 
+async def process_image(user_id: str, message_id: str):
+    """バックグラウンドで画像処理・広告生成・返信を行う"""
+    try:
+        # 画像取得
+        image_bytes = await get_image_content(message_id)
+        print(f"Image size: {len(image_bytes)} bytes")
+
+        # 車情報抽出
+        car_info = await extract_car_info(image_bytes)
+        print(f"Car info: {car_info[:200]}")
+
+        await push_message(user_id, [{
+            "type": "text",
+            "text": f"✅ 解析完了！\n\n【車情報（仕入先・価格除外済み）】\n{car_info}\n\n📝 広告文を生成中..."
+        }])
+
+        # 広告文生成
+        ads = await generate_ads(car_info)
+        ad_messages = format_ads_for_line(ads)
+
+        await push_message(user_id, [{
+            "type": "text",
+            "text": "🎉 広告文生成完了！\n中国語・英語・ロシア語 × 5SNS = 15種類"
+        }])
+
+        for i in range(0, len(ad_messages), 5):
+            await push_message(user_id, ad_messages[i:i+5])
+
+        await push_message(user_id, [{
+            "type": "text",
+            "text": "✨ 完了！各SNSにコピー＆ペーストしてご使用ください。\n\n次の車の写真を送ってください 🚗"
+        }])
+
+    except Exception as e:
+        print(f"Error in process_image: {e}")
+        await push_message(user_id, [{
+            "type": "text",
+            "text": f"❌ エラーが発生しました。\n{str(e)}\n\n写真を再送してください。"
+        }])
+
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
     signature = request.headers.get("X-Line-Signature", "")
+
     if not verify_signature(body, signature):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     data = json.loads(body)
+    print(f"Webhook received: {json.dumps(data)[:300]}")
+
     for event in data.get("events", []):
         event_type = event.get("type")
         reply_token = event.get("replyToken")
@@ -164,22 +209,21 @@ async def webhook(request: Request):
 
         if event_type == "message" and event.get("message", {}).get("type") == "image":
             message_id = event["message"]["id"]
-            await reply_message(reply_token, [{"type": "text", "text": "📋 オークションシートを受信しました！\n\n🔍 車情報を解析中...\n⏳ 少々お待ちください（約30秒）"}])
-            try:
-                image_bytes = await get_image_content(message_id)
-                car_info = await extract_car_info(image_bytes)
-                await push_message(user_id, [{"type": "text", "text": f"✅ 解析完了！\n\n【車情報（仕入先・価格除外済み）】\n{car_info}\n\n📝 広告文を生成中..."}])
-                ads = await generate_ads(car_info)
-                ad_messages = format_ads_for_line(ads)
-                await push_message(user_id, [{"type": "text", "text": "🎉 広告文生成完了！\n中国語・英語・ロシア語 × 5SNS = 15種類"}])
-                for i in range(0, len(ad_messages), 5):
-                    await push_message(user_id, ad_messages[i:i+5])
-                await push_message(user_id, [{"type": "text", "text": "✨ 完了！各SNSにコピー＆ペーストしてご使用ください。\n\n次の車の写真を送ってください 🚗"}])
-            except Exception as e:
-                await push_message(user_id, [{"type": "text", "text": f"❌ エラーが発生しました。\n{str(e)}\n\n写真を再送してください。"}])
+
+            # 即座に受信確認を返信
+            await reply_message(reply_token, [{
+                "type": "text",
+                "text": "📋 オークションシートを受信しました！\n\n🔍 車情報を解析中...\n⏳ 少々お待ちください（約30秒）"
+            }])
+
+            # バックグラウンドで処理
+            background_tasks.add_task(process_image, user_id, message_id)
 
         elif event_type == "message" and event.get("message", {}).get("type") == "text":
-            await reply_message(reply_token, [{"type": "text", "text": "🚗 AUTO AD GENERATOR\n\nオークションシートの写真を送ってください！\n自動で以下を生成します：\n\n🇨🇳 中国語\n🇬🇧 English\n🇷🇺 Русский\n\n× X / Facebook / TikTok / 小紅書 / Instagram\n\n= 15種類の広告文を自動生成！\n※仕入先・価格は自動で除外されます"}])
+            await reply_message(reply_token, [{
+                "type": "text",
+                "text": "🚗 AUTO AD GENERATOR\n\nオークションシートの写真を送ってください！\n自動で以下を生成します：\n\n🇨🇳 中国語\n🇬🇧 English\n🇷🇺 Русский\n\n× X / Facebook / TikTok / 小紅書 / Instagram\n\n= 15種類の広告文を自動生成！\n※仕入先・価格は自動で除外されます"
+            }])
 
     return JSONResponse(content={"status": "ok"})
 
