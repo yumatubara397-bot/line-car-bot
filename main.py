@@ -21,9 +21,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 LINE_API = "https://api.line.me/v2/bot"
 # 画像解析用（vision対応）
-GEMINI_VISION_API = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent"
+GEMINI_VISION_API = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent"
 # テキスト生成用
-GEMINI_TEXT_API = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+GEMINI_TEXT_API = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent"
 
 def verify_signature(body: bytes, signature: str) -> bool:
     hash_val = hmac.new(
