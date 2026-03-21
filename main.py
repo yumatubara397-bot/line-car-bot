@@ -190,9 +190,8 @@ def format_ads_for_line(ads: dict) -> list:
         messages.append({"type": "text", "text": text.strip()})
     return messages
 
-async def process_image(user_id: str, message_id: str):
+async def process_image_bytes(user_id: str, image_bytes: bytes):
     try:
-        image_bytes = await get_image_content(message_id)
         print(f"Image size: {len(image_bytes)} bytes")
 
         car_info = await extract_car_info(image_bytes)
@@ -220,7 +219,7 @@ async def process_image(user_id: str, message_id: str):
         }])
 
     except Exception as e:
-        print(f"Error in process_image: {e}")
+        print(f"Error in process_image_bytes: {e}")
         await push_message(user_id, [{
             "type": "text",
             "text": f"❌ エラーが発生しました。\n{str(e)}\n\n写真を再送してください。"
@@ -244,11 +243,13 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 
         if event_type == "message" and event.get("message", {}).get("type") == "image":
             message_id = event["message"]["id"]
+            # 画像を先に取得（LINEの画像は時間制限あり）
+            image_bytes = await get_image_content(message_id)
             await reply_message(reply_token, [{
                 "type": "text",
                 "text": "📋 オークションシートを受信しました！\n\n🔍 車情報を解析中...\n⏳ 少々お待ちください（約30秒）"
             }])
-            background_tasks.add_task(process_image, user_id, message_id)
+            background_tasks.add_task(process_image_bytes, user_id, image_bytes)
 
         elif event_type == "message" and event.get("message", {}).get("type") == "text":
             await reply_message(reply_token, [{
