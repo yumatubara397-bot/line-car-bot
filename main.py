@@ -70,7 +70,7 @@ async def get_image_content(message_id: str) -> bytes:
         )
         content = res.content
         if not content or len(content) == 0:
-            raise Exception(f"画像データが空です。LINEからの取得に失敗しました。status: {res.status_code}")
+            raise Exception(f"画像データが空です。status: {res.status_code}")
         print(f"Image fetched: {len(content)} bytes, status: {res.status_code}")
         return content
 
@@ -190,8 +190,10 @@ def format_ads_for_line(ads: dict) -> list:
         messages.append({"type": "text", "text": text.strip()})
     return messages
 
-async def process_image_bytes(user_id: str, image_bytes: bytes):
+async def process_image(user_id: str, message_id: str):
     try:
+        await asyncio.sleep(3)  # LINEの画像準備を待つ
+        image_bytes = await get_image_content(message_id)
         print(f"Image size: {len(image_bytes)} bytes")
 
         car_info = await extract_car_info(image_bytes)
@@ -219,7 +221,7 @@ async def process_image_bytes(user_id: str, image_bytes: bytes):
         }])
 
     except Exception as e:
-        print(f"Error in process_image_bytes: {e}")
+        print(f"Error in process_image: {e}")
         await push_message(user_id, [{
             "type": "text",
             "text": f"❌ エラーが発生しました。\n{str(e)}\n\n写真を再送してください。"
@@ -243,13 +245,11 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 
         if event_type == "message" and event.get("message", {}).get("type") == "image":
             message_id = event["message"]["id"]
-            # 画像を先に取得（LINEの画像は時間制限あり）
-            image_bytes = await get_image_content(message_id)
             await reply_message(reply_token, [{
                 "type": "text",
                 "text": "📋 オークションシートを受信しました！\n\n🔍 車情報を解析中...\n⏳ 少々お待ちください（約30秒）"
             }])
-            background_tasks.add_task(process_image_bytes, user_id, image_bytes)
+            background_tasks.add_task(process_image, user_id, message_id)
 
         elif event_type == "message" and event.get("message", {}).get("type") == "text":
             await reply_message(reply_token, [{
