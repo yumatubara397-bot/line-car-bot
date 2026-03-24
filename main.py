@@ -28,7 +28,6 @@ TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
 CLAUDE_API = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
-# ユーザーごとの写真を一時保存
 user_photos = {}
 
 def get_drive_service():
@@ -134,7 +133,7 @@ async def extract_car_info(image_bytes: bytes) -> dict:
 
 以下のJSON形式で返してください（他のテキスト不要）：
 {"model_code":"型式","car_info":"日本語の箇条書き情報"}"""
-    
+
     result = await call_claude_vision(image_bytes, prompt)
     clean = result.replace("```json", "").replace("```", "").strip()
     try:
@@ -144,7 +143,7 @@ async def extract_car_info(image_bytes: bytes) -> dict:
 
 async def generate_ads(car_info: str) -> str:
     import random
-    
+
     variations = [
         "コンテナ発送対応・まとめ購入歓迎の視点で",
         "中古部品も同時発送可能な事業者向けの視点で",
@@ -153,7 +152,7 @@ async def generate_ads(car_info: str) -> str:
         "海外バイヤー向けの卸売・まとめ買い歓迎の視点で"
     ]
     variation = random.choice(variations)
-    
+
     prompt = f"""あなたは国際中古車・部品輸出の事業者向けSNS広告のプロです。
 
 【今回の広告の切り口】
@@ -162,7 +161,7 @@ async def generate_ads(car_info: str) -> str:
 【厳守ルール】
 1. 価格・金額は絶対に書かない
 2. オークション・仕入先は書かない
-3. JSONのみ返す（```不要）
+3. JSONのみ返す
 4. 事業者・バイヤー向けのプロフェッショナルなトーンで
 
 【車情報】
@@ -205,82 +204,76 @@ def upload_to_drive(service, file_bytes: bytes, filename: str, folder_id: str, m
 
 def format_ads_message(ads_dict: dict, lang: str, flag: str, title: str) -> str:
     sns_labels = {
-        "x": "𝕏 X (Twitter)", "fb": "f Facebook",
-        "tt": "♪ TikTok", "xhs": "✿ 小紅書 (RED)", "ig": "◎ Instagram"
+        "x": "X (Twitter)", "fb": "Facebook",
+        "tt": "TikTok", "xhs": "小紅書 (RED)", "ig": "Instagram"
     }
-    text = f"{flag} 【{title}】\n" + "─"*20 + "\n\n"
+    text = f"{flag} [{title}]\n" + "-"*20 + "\n\n"
     for sns_id, label in sns_labels.items():
-        text += f"【{label}】\n{ads_dict.get(lang, {}).get(sns_id, '')}\n\n"
+        text += f"[{label}]\n{ads_dict.get(lang, {}).get(sns_id, '')}\n\n"
     return text.strip()
 
 async def process_photos(chat_id: int, photos_data: list):
     try:
-        await send_message(chat_id, "⏳ 処理中です。しばらくお待ちください（約1分）...")
+        await send_message(chat_id, "Processing... Please wait about 1 minute.")
 
-        # 全画像をダウンロード
         images = []
         for file_id in photos_data:
             img_bytes = await get_image_content(file_id)
             images.append(img_bytes)
 
-        # 最初の画像（オークションシート）から車情報を抽出
-        await send_message(chat_id, "🔍 車情報を解析中...")
+        await send_message(chat_id, "Analyzing car information...")
         car_data = await extract_car_info(images[0])
         model_code = car_data.get("model_code", "unknown")
         car_info = car_data.get("car_info", "")
 
-        # Google Driveにフォルダ作成
         date_str = datetime.now().strftime("%Y%m%d")
         folder_name = f"{date_str}_{model_code}"
-        
+
         drive_service = get_drive_service()
         folder_id = create_drive_folder(drive_service, folder_name, GOOGLE_DRIVE_FOLDER_ID)
-        
-        # 写真をDriveに保存
+
         for i, img_bytes in enumerate(images):
             filename = f"photo_{i+1}.jpg"
             upload_to_drive(drive_service, img_bytes, filename, folder_id)
 
-        await send_message(chat_id, f"✅ 車情報解析完了！\n\n【車情報】\n{car_info}\n\n📝 広告文を生成中（5言語×5SNS=25種類）...")
+        await send_message(chat_id,
+            f"Car info extracted!\n\n{car_info}\n\nGenerating ads (5 languages x 5 SNS = 25 types)..."
+        )
 
-        # 広告文生成
         ads_raw = await generate_ads(car_info)
         ads_dict = json.loads(ads_raw)
 
-        # 広告文をDriveに保存
-        ads_text = f"【車情報】\n{car_info}\n\n"
+        ads_text = f"[Car Info]\n{car_info}\n\n"
         for lang, flag, title in [
-            ("ja","🇯🇵","日本語"), ("zh","🇨🇳","中国語"),
-            ("en","🇬🇧","English"), ("ru","🇷🇺","Русский"), ("fr","🇫🇷","Français")
+            ("ja", "JP", "Japanese"), ("zh", "CN", "Chinese"),
+            ("en", "EN", "English"), ("ru", "RU", "Russian"), ("fr", "FR", "French")
         ]:
             ads_text += format_ads_message(ads_dict, lang, flag, title) + "\n\n"
-        
+
         upload_to_drive(
             drive_service,
             ads_text.encode("utf-8"),
-            "広告文.txt",
+            "ads.txt",
             folder_id,
             mime_type="text/plain"
         )
 
-        # Telegramに送信
-        await send_message(chat_id, f"🎉 広告文生成完了！\n📁 Drive保存先：{folder_name}")
+        await send_message(chat_id, f"Ads generated! Saved to Drive: {folder_name}")
 
         for lang, flag, title in [
-            ("ja","🇯🇵","日本語広告文"), ("zh","🇨🇳","中国語広告文"),
-            ("en","🇬🇧","English Ad"), ("ru","🇷🇺","Русский"), ("fr","🇫🇷","Français")
+            ("ja", "JP", "Japanese"), ("zh", "CN", "Chinese"),
+            ("en", "EN", "English"), ("ru", "RU", "Russian"), ("fr", "FR", "French")
         ]:
             msg = format_ads_message(ads_dict, lang, flag, title)
             await send_message(chat_id, msg)
 
-        await send_message(chat_id, "✨ 完了！次の車の写真を送ってください 🚗")
+        await send_message(chat_id, "Done! Send photos of the next car.")
 
-        # ユーザーデータをリセット
         user_photos.pop(chat_id, None)
 
     except Exception as e:
         print(f"Error: {e}")
-        await send_message(chat_id, f"❌ エラーが発生しました。\n{str(e)}\n\n写真を再送してください。")
+        await send_message(chat_id, f"Error: {str(e)}\n\nPlease resend the photos.")
         user_photos.pop(chat_id, None)
 
 @app.post("/webhook")
@@ -294,49 +287,45 @@ async def webhook(request: Request):
     if not chat_id:
         return JSONResponse(content={"status": "ok"})
 
-    # 画像メッセージ
     if "photo" in message:
         file_id = message["photo"][-1]["file_id"]
         if chat_id not in user_photos:
             user_photos[chat_id] = []
         user_photos[chat_id].append(file_id)
-        
+
         count = len(user_photos[chat_id])
-        await send_message(chat_id, 
-            f"📸 写真{count}枚受信しました！\n続けて写真を送るか、準備ができたら「OK」を送ってください。"
+        await send_message(chat_id,
+            f"Photo {count} received! Send more photos or type OK when ready."
         )
 
-    # OKメッセージ
     elif "text" in message:
         text = message["text"].strip().upper()
-        
+
         if text == "OK":
             if chat_id in user_photos and len(user_photos[chat_id]) > 0:
                 photos = user_photos[chat_id].copy()
                 asyncio.create_task(process_photos(chat_id, photos))
             else:
-                await send_message(chat_id, "⚠️ 写真が見つかりません。先に写真を送ってください。")
-        
+                await send_message(chat_id, "No photos found. Please send photos first.")
+
         elif text in ["/START", "START", "/HELP"]:
             await send_message(chat_id,
-                "🚗 車広告自動生成Bot\n\n"
-                "【使い方】\n"
-                "1️⃣ オークションシートの写真を送る\n"
-                "2️⃣ 車体写真も送る（複数可）\n"
-                "3️⃣「OK」と送信\n"
-                "4️⃣ 自動で広告文生成＆Drive保存！\n\n"
-                "【生成される広告】\n"
-                "🇯🇵 日本語 / 🇨🇳 中国語 / 🇬🇧 English\n"
-                "🇷🇺 Русский / 🇫🇷 Français\n"
-                "× X / Facebook / TikTok / 小紅書 / Instagram\n"
-                "= 25種類の広告文を自動生成！\n\n"
-                "【対応サービス】\n"
-                "🚢 コンテナ発送・まとめ購入対応\n"
-                "🔧 タイヤ・エンジン・外装部品も同時発送可"
+                "Car Ad Generator Bot\n\n"
+                "How to use:\n"
+                "1. Send auction sheet photo\n"
+                "2. Send car body photos\n"
+                "3. Type OK\n"
+                "4. Ads will be generated and saved to Drive!\n\n"
+                "Languages: JP / CN / EN / RU / FR\n"
+                "Platforms: X / Facebook / TikTok / Xiaohongshu / Instagram\n"
+                "= 25 types of ads!\n\n"
+                "Services:\n"
+                "Container shipping available\n"
+                "Parts also available: tires, engines, bumpers, etc."
             )
         else:
             await send_message(chat_id,
-                "📸 オークションシートと車体写真を送ってください。\n準備ができたら「OK」と送信してください。"
+                "Please send auction sheet and car photos.\nType OK when ready."
             )
 
     return JSONResponse(content={"status": "ok"})
@@ -344,16 +333,3 @@ async def webhook(request: Request):
 @app.get("/")
 async def health():
     return {"status": "running", "service": "Telegram Car Ad Generator Bot (Claude API + Google Drive)"}
-```
-
----
-
-## あわせてrequirements.txtも更新が必要です！
-
-GitHubで `requirements.txt` を開いて以下に変更してください：
-```
-fastapi
-uvicorn
-httpx
-google-auth
-google-api-python-client
