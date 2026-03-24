@@ -1,422 +1,292 @@
 """
 Telegram Bot - 車オークションシート自動広告生成
-Claude API (Anthropic) 使用
+Claude API (Anthropic) + Google Drive 使用
 """
 
 import os
 import json
 import base64
 import asyncio
-from typing import Any, Dict, List
-
 import httpx
+import io
+from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 app = FastAPI()
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
 CLAUDE_API = "https://api.anthropic.com/v1/messages"
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
-# いま使えているモデル名をそのまま維持
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+# ユーザーごとの写真を一時保存
+user_photos = {}
 
-# TelegramのsendMessage上限は4096文字。余裕を持たせる
-TELEGRAM_MESSAGE_LIMIT = 3500
+def get_drive_service():
+    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    creds = service_account.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    return build("drive", "v3", credentials=creds)
 
-
-def get_claude_headers() -> Dict[str, str]:
+def get_claude_headers():
     return {
         "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
 
-
-def extract_text_from_claude_response(data: Dict[str, Any]) -> str:
-    """
-    Claudeレスポンスのcontent配列からtextを安全に連結する
-    """
-    if "error" in data:
-        raise Exception(data["error"].get("message", "Unknown Claude API error"))
-
-    content = data.get("content", [])
-    texts: List[str] = []
-
-    for block in content:
-        if isinstance(block, dict) and block.get("type") == "text":
-            texts.append(block.get("text", ""))
-
-    text = "\n".join(t for t in texts if t).strip()
-    if not text:
-        raise Exception(f"Claude response text is empty: {json.dumps(data)[:1000]}")
-    return text
-
-
-def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> List[str]:
-    """
-    Telegram送信用に長文を分割する
-    できるだけ段落区切り・改行区切りで切る
-    """
-    if len(text) <= limit:
-        return [text]
-
-    chunks: List[str] = []
-    remaining = text
-
-    while len(remaining) > limit:
-        split_at = remaining.rfind("\n\n", 0, limit)
-        if split_at == -1:
-            split_at = remaining.rfind("\n", 0, limit)
-        if split_at == -1:
-            split_at = limit
-
-        chunk = remaining[:split_at].strip()
-        if not chunk:
-            chunk = remaining[:limit]
-            split_at = limit
-
-        chunks.append(chunk)
-        remaining = remaining[split_at:].strip()
-
-    if remaining:
-        chunks.append(remaining)
-
-    return chunks
-
-
 async def send_message(chat_id: int, text: str):
-    """
-    長文は自動分割して送る
-    """
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        for part in split_message(text):
-            r = await client.post(
-                f"{TELEGRAM_API}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": part,
-                    "disable_web_page_preview": True,
-                },
-            )
-            print(f"send_message status: {r.status_code} {r.text[:300]}")
-
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text}
+        )
+        print(f"send_message status: {r.status_code}")
 
 async def get_image_content(file_id: str) -> bytes:
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # file_path取得
         res = await client.get(
             f"{TELEGRAM_API}/getFile",
-            params={"file_id": file_id},
+            params={"file_id": file_id}
         )
-        data = res.json()
-        print(f"getFile response: {json.dumps(data)[:300]}")
-
-        if not data.get("ok") or "result" not in data or "file_path" not in data["result"]:
-            raise Exception(f"Telegram getFile failed: {json.dumps(data)[:1000]}")
-
-        file_path = data["result"]["file_path"]
-
-        # 画像ダウンロード
+        file_path = res.json()["result"]["file_path"]
         img_res = await client.get(f"{TELEGRAM_FILE_API}/{file_path}")
-        img_res.raise_for_status()
-
-        content = img_res.content
-        print(f"Image fetched: {len(content)} bytes")
-        return content
-
-
-def detect_media_type(image_bytes: bytes) -> str:
-    """
-    簡易メディアタイプ判定
-    """
-    if image_bytes.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if image_bytes.startswith(b"RIFF") and b"WEBP" in image_bytes[:20]:
-        return "image/webp"
-    # Telegramのphotoは通常jpegなのでデフォルトをjpegにする
-    return "image/jpeg"
-
+        return img_res.content
 
 async def call_claude_vision(image_bytes: bytes, prompt: str) -> str:
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-    media_type = detect_media_type(image_bytes)
-
-    payload = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": 1500,
-        "temperature": 0,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": image_b64,
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        res = await client.post(
+            CLAUDE_API,
+            headers=get_claude_headers(),
+            json={
+                "model": CLAUDE_MODEL,
+                "max_tokens": 1000,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_b64
+                            }
                         },
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt,
-                    },
-                ],
+                        {"type": "text", "text": prompt}
+                    ]
+                }]
             }
-        ],
-    }
+        )
+        data = res.json()
+        if "error" in data:
+            raise Exception(data["error"]["message"])
+        return data["content"][0]["text"].strip()
 
+async def call_claude_text(prompt: str) -> str:
     async with httpx.AsyncClient(timeout=120.0) as client:
         res = await client.post(
             CLAUDE_API,
             headers=get_claude_headers(),
-            json=payload,
-        )
-        data = res.json()
-        print(f"Claude vision response: {json.dumps(data)[:1000]}")
-        return extract_text_from_claude_response(data)
-
-
-async def call_claude_text(prompt: str, max_tokens: int = 4000) -> str:
-    payload = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": max_tokens,
-        "temperature": 0,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
+            json={
+                "model": CLAUDE_MODEL,
+                "max_tokens": 8000,
+                "messages": [{
+                    "role": "user",
+                    "content": prompt
+                }]
             }
-        ],
-    }
-
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        res = await client.post(
-            CLAUDE_API,
-            headers=get_claude_headers(),
-            json=payload,
         )
         data = res.json()
-        print(f"Claude text response: {json.dumps(data)[:1000]}")
-        return extract_text_from_claude_response(data)
+        if "error" in data:
+            raise Exception(data["error"]["message"])
+        return data["content"][0]["text"].strip()
 
-
-def extract_json_block(text: str) -> str:
-    """
-    Claude返答から最初の{ ... 最後の }を抜き出す
-    code block混在でも対応しやすくする
-    """
-    cleaned = text.replace("```json", "").replace("```", "").strip()
-
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError(f"JSON object not found in Claude response: {cleaned[:1000]}")
-
-    return cleaned[start:end + 1]
-
-
-async def repair_broken_json(broken_json_text: str) -> dict:
-    """
-    Claudeが返した壊れたJSONをClaude自身に修復させる
-    """
-    repair_prompt = f"""次のテキストは壊れたJSONです。
-意味を変えずに、有効なJSONへ修正してください。
-
-【厳守】
-- JSONのみ返す
-- コードブロック禁止
-- 文字列中の改行は \\n にする
-- 文字列中のダブルクォーテーションは適切にエスケープする
-- キー名は変更しない
-- 値を勝手に省略しない
-
-{broken_json_text}
-"""
-
-    repaired_raw = await call_claude_text(repair_prompt, max_tokens=5000)
-    print(f"REPAIRED RAW: {repaired_raw[:2000]}")
-    repaired_json_text = extract_json_block(repaired_raw)
-    return json.loads(repaired_json_text)
-
-
-async def extract_car_info(image_bytes: bytes) -> str:
-    prompt = """このオークションシートの画像から車の情報を読み取り、以下の形式でまとめてください。
+async def extract_car_info(image_bytes: bytes) -> dict:
+    prompt = """このオークションシートの画像から車の情報を読み取ってください。
 
 【除外する情報（絶対に含めない）】
 - オークション名・仕入先・出品者情報
 - 価格・R券・落札金額などの金額情報
-- 車台番号・登録番号・バーコード番号
 
 【抽出する情報】
 - メーカー・ブランド
 - モデル名・グレード
-- 年式
-- 走行距離
-- 排気量
+- 型式（例：ZN6、HE12など）
+- 年式、走行距離、排気量
 - ミッション種類（AT/MT）
 - ボディカラー
 - 主要装備・オプション
 - 車検有効期限
 - 修復歴の有無
-- 状態・コンディション（外装・内装グレード）
-- ハンドル位置
-- その他特記事項
+- 状態・コンディション
 
-【出力ルール】
-- 日本語
-- 箇条書き
-- 不明な項目は「不明」と書く
-- 推測しすぎない
-"""
-    return await call_claude_vision(image_bytes, prompt)
+以下のJSON形式で返してください（他のテキスト不要）：
+{"model_code":"型式","car_info":"日本語の箇条書き情報"}"""
+    
+    result = await call_claude_vision(image_bytes, prompt)
+    clean = result.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(clean)
+    except:
+        return {"model_code": "unknown", "car_info": result}
 
+async def generate_ads(car_info: str) -> str:
+    import random
+    
+    variations = [
+        "コンテナ発送対応・まとめ購入歓迎の視点で",
+        "中古部品も同時発送可能な事業者向けの視点で",
+        "タイヤ・ホイール・エンジン部品もセット販売可能な視点で",
+        "バンパー・外装部品・内装部品も一括輸出可能な視点で",
+        "海外バイヤー向けの卸売・まとめ買い歓迎の視点で"
+    ]
+    variation = random.choice(variations)
+    
+    prompt = f"""あなたは国際中古車・部品輸出の事業者向けSNS広告のプロです。
 
-async def generate_ads(car_info: str) -> dict:
-    prompt = f"""あなたは国際的なSNS広告のプロのコピーライターです。
+【今回の広告の切り口】
+{variation}
 
 【厳守ルール】
 1. 価格・金額は絶対に書かない
-2. オークション・仕入先・入手経路は絶対に書かない
-3. 車台番号・登録番号は書かない
-4. 必ず有効なJSONのみ返す
-5. コードブロックは使わない
-6. JSONの前後に説明文を一切付けない
-7. 文字列中の改行は必ず \\n で表現する
-8. 文字列中の " は必ず \\" にする
-9. 全ての値はJSON stringにする
-10. 小紅書は必ず中国語で書く
+2. オークション・仕入先は書かない
+3. JSONのみ返す（```不要）
+4. 事業者・バイヤー向けのプロフェッショナルなトーンで
 
 【車情報】
 {car_info}
 
+【対応可能なサービス（広告に自然に含める）】
+- コンテナ発送・まとめ購入対応
+- 中古タイヤ・ホイール同時発送可
+- エンジン・ミッション部品も取扱
+- バンパー・外装・内装部品も一括輸出可
+- 世界各地への輸出実績あり
+
 【各SNSの仕様】
-X(Twitter): 本文全角140文字以内、ハッシュタグ3〜5個、力強く簡潔
-Facebook: 本文全角300〜500文字、ハッシュタグ3〜5個、ストーリー調、絵文字使用
-TikTok: 本文全角300〜500文字、ハッシュタグ3〜5個、エネルギッシュ・トレンド感
-Instagram: 本文全角300〜350文字、ハッシュタグ3〜5個、ライフスタイル訴求、絵文字使用
-小紅書: 全セクション必ず中国語、本文全角300〜500文字、#标签形式3〜5個、日記風、絵文字多め
+X(Twitter): 全角140文字以内、ハッシュタグ3〜5個、力強く簡潔
+Facebook: 全角300〜500文字、ハッシュタグ3〜5個、ストーリー調絵文字使用
+TikTok: 全角300〜500文字、ハッシュタグ3〜5個、エネルギッシュ
+Instagram: 全角300〜350文字、ハッシュタグ3〜5個、ライフスタイル訴求
+小紅書: 必ず中国語、全角300〜500文字、#标签形式、日記風絵文字多め
 
-【重要】
-- ハッシュタグは本文末尾に入れる
-- 本文中に改行を入れてよいが、JSON文字列内では必ず \\n を使う
-- 必ず次の形で返すこと
+JSONのみ返してください：
+{{"ja":{{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."}},"zh":{{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."}},"en":{{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."}},"ru":{{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."}},"fr":{{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."}}}}"""
 
-{{
-  "zh": {{
-    "x": "...",
-    "fb": "...",
-    "tt": "...",
-    "xhs": "...",
-    "ig": "..."
-  }},
-  "en": {{
-    "x": "...",
-    "fb": "...",
-    "tt": "...",
-    "xhs": "...",
-    "ig": "..."
-  }},
-  "ru": {{
-    "x": "...",
-    "fb": "...",
-    "tt": "...",
-    "xhs": "...",
-    "ig": "..."
-  }}
-}}
-"""
+    raw = await call_claude_text(prompt)
+    clean = raw.replace("```json", "").replace("```", "").strip()
+    return clean
 
-    raw = await call_claude_text(prompt, max_tokens=5000)
-    print(f"RAW ADS RESPONSE: {raw[:3000]}")
-
-    json_text = extract_json_block(raw)
-
-    try:
-        return json.loads(json_text)
-    except json.JSONDecodeError as e:
-        print(f"JSON parse failed: {e}")
-        print(f"BROKEN JSON: {json_text[:4000]}")
-        return await repair_broken_json(json_text)
-
-
-def format_ads(ads: dict) -> list:
-    sns_labels = {
-        "x": "𝕏 X (Twitter)",
-        "fb": "f Facebook",
-        "tt": "♪ TikTok",
-        "xhs": "✿ 小紅書 (RED)",
-        "ig": "◎ Instagram",
+def create_drive_folder(service, folder_name: str, parent_id: str) -> str:
+    file_metadata = {
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id]
     }
+    folder = service.files().create(body=file_metadata, fields="id").execute()
+    return folder.get("id")
 
-    messages = []
+def upload_to_drive(service, file_bytes: bytes, filename: str, folder_id: str, mime_type: str = "image/jpeg"):
+    file_metadata = {"name": filename, "parents": [folder_id]}
+    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type)
+    service.files().create(body=file_metadata, media_body=media, fields="id").execute()
 
-    for lang, flag, title in [
-        ("zh", "🇨🇳", "中国語広告文"),
-        ("en", "🇬🇧", "English Ad Copy"),
-        ("ru", "🇷🇺", "Русский язык"),
-    ]:
-        lang_ads = ads.get(lang, {})
-        text = f"{flag} 【{title}】\n" + "─" * 20 + "\n\n"
+def format_ads_message(ads_dict: dict, lang: str, flag: str, title: str) -> str:
+    sns_labels = {
+        "x": "𝕏 X (Twitter)", "fb": "f Facebook",
+        "tt": "♪ TikTok", "xhs": "✿ 小紅書 (RED)", "ig": "◎ Instagram"
+    }
+    text = f"{flag} 【{title}】\n" + "─"*20 + "\n\n"
+    for sns_id, label in sns_labels.items():
+        text += f"【{label}】\n{ads_dict.get(lang, {}).get(sns_id, '')}\n\n"
+    return text.strip()
 
-        for sns_id, label in sns_labels.items():
-            value = lang_ads.get(sns_id, "")
-            text += f"【{label}】\n{value}\n\n"
-
-        messages.append(text.strip())
-
-    return messages
-
-
-async def process_image(chat_id: int, file_id: str):
+async def process_photos(chat_id: int, photos_data: list):
     try:
-        image_bytes = await get_image_content(file_id)
-        print(f"Image size: {len(image_bytes)} bytes")
+        await send_message(chat_id, "⏳ 処理中です。しばらくお待ちください（約1分）...")
 
-        car_info = await extract_car_info(image_bytes)
-        print(f"Car info extracted: {car_info[:500]}")
+        # 全画像をダウンロード
+        images = []
+        for file_id in photos_data:
+            img_bytes = await get_image_content(file_id)
+            images.append(img_bytes)
 
-        await send_message(
-            chat_id,
-            f"✅ 解析完了！\n\n【車情報（仕入先・価格除外済み）】\n{car_info}\n\n📝 広告文を生成中..."
+        # 最初の画像（オークションシート）から車情報を抽出
+        await send_message(chat_id, "🔍 車情報を解析中...")
+        car_data = await extract_car_info(images[0])
+        model_code = car_data.get("model_code", "unknown")
+        car_info = car_data.get("car_info", "")
+
+        # Google Driveにフォルダ作成
+        date_str = datetime.now().strftime("%Y%m%d")
+        folder_name = f"{date_str}_{model_code}"
+        
+        drive_service = get_drive_service()
+        folder_id = create_drive_folder(drive_service, folder_name, GOOGLE_DRIVE_FOLDER_ID)
+        
+        # 写真をDriveに保存
+        for i, img_bytes in enumerate(images):
+            filename = f"photo_{i+1}.jpg"
+            upload_to_drive(drive_service, img_bytes, filename, folder_id)
+
+        await send_message(chat_id, f"✅ 車情報解析完了！\n\n【車情報】\n{car_info}\n\n📝 広告文を生成中（5言語×5SNS=25種類）...")
+
+        # 広告文生成
+        ads_raw = await generate_ads(car_info)
+        ads_dict = json.loads(ads_raw)
+
+        # 広告文をDriveに保存
+        ads_text = f"【車情報】\n{car_info}\n\n"
+        for lang, flag, title in [
+            ("ja","🇯🇵","日本語"), ("zh","🇨🇳","中国語"),
+            ("en","🇬🇧","English"), ("ru","🇷🇺","Русский"), ("fr","🇫🇷","Français")
+        ]:
+            ads_text += format_ads_message(ads_dict, lang, flag, title) + "\n\n"
+        
+        upload_to_drive(
+            drive_service,
+            ads_text.encode("utf-8"),
+            "広告文.txt",
+            folder_id,
+            mime_type="text/plain"
         )
 
-        ads = await generate_ads(car_info)
-        ad_messages = format_ads(ads)
+        # Telegramに送信
+        await send_message(chat_id, f"🎉 広告文生成完了！\n📁 Drive保存先：{folder_name}")
 
-        await send_message(
-            chat_id,
-            "🎉 広告文生成完了！\n中国語・英語・ロシア語 × 5SNS = 15種類"
-        )
-
-        for msg in ad_messages:
+        for lang, flag, title in [
+            ("ja","🇯🇵","日本語広告文"), ("zh","🇨🇳","中国語広告文"),
+            ("en","🇬🇧","English Ad"), ("ru","🇷🇺","Русский"), ("fr","🇫🇷","Français")
+        ]:
+            msg = format_ads_message(ads_dict, lang, flag, title)
             await send_message(chat_id, msg)
 
-        await send_message(
-            chat_id,
-            "✨ 完了！各SNSにコピー＆ペーストしてご使用ください。\n\n次の車の写真を送ってください 🚗"
-        )
+        await send_message(chat_id, "✨ 完了！次の車の写真を送ってください 🚗")
+
+        # ユーザーデータをリセット
+        user_photos.pop(chat_id, None)
 
     except Exception as e:
-        print(f"Error in process_image: {repr(e)}")
-        await send_message(
-            chat_id,
-            f"❌ エラーが発生しました。\n{str(e)}\n\n写真を再送してください。"
-        )
-
+        print(f"Error: {e}")
+        await send_message(chat_id, f"❌ エラーが発生しました。\n{str(e)}\n\n写真を再送してください。")
+        user_photos.pop(chat_id, None)
 
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
-    print(f"Webhook received: {json.dumps(data)[:500]}")
+    print(f"Webhook: {json.dumps(data)[:200]}")
 
     message = data.get("message", {})
     chat_id = message.get("chat", {}).get("id")
@@ -424,46 +294,66 @@ async def webhook(request: Request):
     if not chat_id:
         return JSONResponse(content={"status": "ok"})
 
-    # ボット自身のメッセージは無視
-    from_user = message.get("from", {})
-    if from_user.get("is_bot"):
-        return JSONResponse(content={"status": "ok"})
-
     # 画像メッセージ
-    if "photo" in message and message["photo"]:
+    if "photo" in message:
         file_id = message["photo"][-1]["file_id"]
-
-        await send_message(
-            chat_id,
-            "📋 オークションシートを受信しました！\n\n🔍 車情報を解析中...\n⏳ 少々お待ちください（約30秒）"
+        if chat_id not in user_photos:
+            user_photos[chat_id] = []
+        user_photos[chat_id].append(file_id)
+        
+        count = len(user_photos[chat_id])
+        await send_message(chat_id, 
+            f"📸 写真{count}枚受信しました！\n続けて写真を送るか、準備ができたら「OK」を送ってください。"
         )
 
-        asyncio.create_task(process_image(chat_id, file_id))
-
-    # テキストメッセージ
+    # OKメッセージ
     elif "text" in message:
-        await send_message(
-            chat_id,
-            "🚗 AUTO AD GENERATOR\n\n"
-            "オークションシートの写真を送ってください！\n"
-            "自動で以下を生成します：\n\n"
-            "🇨🇳 中国語\n"
-            "🇬🇧 English\n"
-            "🇷🇺 Русский\n\n"
-            "× X / Facebook / TikTok / 小紅書 / Instagram\n\n"
-            "= 15種類の広告文を自動生成！\n"
-            "※仕入先・価格は自動で除外されます"
-        )
+        text = message["text"].strip().upper()
+        
+        if text == "OK":
+            if chat_id in user_photos and len(user_photos[chat_id]) > 0:
+                photos = user_photos[chat_id].copy()
+                asyncio.create_task(process_photos(chat_id, photos))
+            else:
+                await send_message(chat_id, "⚠️ 写真が見つかりません。先に写真を送ってください。")
+        
+        elif text in ["/START", "START", "/HELP"]:
+            await send_message(chat_id,
+                "🚗 車広告自動生成Bot\n\n"
+                "【使い方】\n"
+                "1️⃣ オークションシートの写真を送る\n"
+                "2️⃣ 車体写真も送る（複数可）\n"
+                "3️⃣「OK」と送信\n"
+                "4️⃣ 自動で広告文生成＆Drive保存！\n\n"
+                "【生成される広告】\n"
+                "🇯🇵 日本語 / 🇨🇳 中国語 / 🇬🇧 English\n"
+                "🇷🇺 Русский / 🇫🇷 Français\n"
+                "× X / Facebook / TikTok / 小紅書 / Instagram\n"
+                "= 25種類の広告文を自動生成！\n\n"
+                "【対応サービス】\n"
+                "🚢 コンテナ発送・まとめ購入対応\n"
+                "🔧 タイヤ・エンジン・外装部品も同時発送可"
+            )
+        else:
+            await send_message(chat_id,
+                "📸 オークションシートと車体写真を送ってください。\n準備ができたら「OK」と送信してください。"
+            )
 
     return JSONResponse(content={"status": "ok"})
 
-
 @app.get("/")
 async def health():
-    return {
-        "status": "running",
-        "service": "Telegram Car Ad Generator Bot (Claude API)",
-        "model": CLAUDE_MODEL,
-        "has_anthropic_key": bool(ANTHROPIC_API_KEY),
-        "has_telegram_token": bool(TELEGRAM_BOT_TOKEN),
-    }
+    return {"status": "running", "service": "Telegram Car Ad Generator Bot (Claude API + Google Drive)"}
+```
+
+---
+
+## あわせてrequirements.txtも更新が必要です！
+
+GitHubで `requirements.txt` を開いて以下に変更してください：
+```
+fastapi
+uvicorn
+httpx
+google-auth
+google-api-python-client
