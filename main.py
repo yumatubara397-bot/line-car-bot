@@ -21,7 +21,7 @@ from googleapiclient.http import MediaIoBaseUpload
 
 app = FastAPI()
 
-APP_VERSION = "2026-03-28-v4"
+APP_VERSION = "2026-03-28-v5"
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -144,16 +144,13 @@ async def call_claude_text(prompt: str) -> str:
         return data["content"][0]["text"].strip()
 
 
-def strip_code_fences(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
-    text = re.sub(r"\n?```$", "", text)
-    text = text.replace("```json", "").replace("```", "").strip()
-    return text
-
-
 def extract_json_block(text: str) -> str:
-    text = strip_code_fences(text)
+    # コードフェンスを全て除去
+    text = text.strip()
+    text = re.sub(r"```[a-zA-Z]*", "", text)
+    text = text.replace("```", "").strip()
+
+    # { } ブロックを抽出
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -190,7 +187,7 @@ async def extract_car_info(image_bytes: bytes) -> dict:
 【重要ルール】
 - 必ず有効なJSONのみを返してください
 - JSON以外の文章は一切不要です
-- コードブロック（```）は使わないでください
+- コードブロック（```）は絶対に使わないでください
 - キー名も値も必ずダブルクォートを使ってください
 
 【除外する情報（絶対に含めない）】
@@ -209,19 +206,13 @@ async def extract_car_info(image_bytes: bytes) -> dict:
 - 修復歴の有無
 - 状態・コンディション
 
-【返答形式】
-{"model_code":"型式","car_info":"・メーカー...\n・モデル...\n・年式..."}"""
+返答例：
+{"model_code":"ZN6","car_info":"・メーカー：トヨタ\n・モデル：86\n・年式：2012年"}"""
 
     result = await call_claude_vision(image_bytes, prompt)
     print("extract_car_info raw:", result)
 
-    # コードフェンスと余分なテキストを除去してからパース
-    cleaned = result.strip()
-    cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
-    cleaned = re.sub(r"\n?```$", "", cleaned)
-    cleaned = cleaned.replace("```json", "").replace("```", "").strip()
-
-    parsed = try_parse_json_loose(cleaned)
+    parsed = try_parse_json_loose(result)
     if isinstance(parsed, dict):
         model_code = str(parsed.get("model_code", "unknown")).strip() or "unknown"
         car_info = str(parsed.get("car_info", "")).strip()
@@ -231,7 +222,7 @@ async def extract_car_info(image_bytes: bytes) -> dict:
 
     return {
         "model_code": "unknown",
-        "car_info": cleaned.strip() if cleaned.strip() else "・車両情報を抽出できませんでした"
+        "car_info": result.strip() if result.strip() else "・車両情報を抽出できませんでした"
     }
 
 
@@ -268,7 +259,7 @@ async def generate_ads(car_info: str) -> dict:
 5. 必ず全5言語（ja/zh/en/ru/fr）全て生成すること
 6. JSON以外の説明文は一切書かない
 7. キー名も値も必ずダブルクォートを使う
-8. コードブロック（```）は使わない
+8. コードブロック（```）は絶対に使わない
 
 【車情報】
 {car_info}
