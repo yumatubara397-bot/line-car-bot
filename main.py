@@ -2,6 +2,7 @@
 Telegram Bot - 車オークションシート自動広告生成
 Claude API (Anthropic) + Google Drive 使用
 写真送信で自動処理開始
+業者向け広告特化版
 """
 
 import os
@@ -21,7 +22,7 @@ from googleapiclient.http import MediaIoBaseUpload
 
 app = FastAPI()
 
-APP_VERSION = "2026-03-30-v1"
+APP_VERSION = "2026-03-30-v2"
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -209,7 +210,7 @@ async def extract_car_info(image_bytes: bytes) -> dict:
 - 主要装備・オプション
 - 車検有効期限
 - 修復歴の有無
-- 状態・コンディション
+- 状態・コンディション（オークション評価点）
 
 返答形式：
 {"model_code":"ZN6","car_info":"・メーカー：トヨタ\\n・モデル：86\\n・年式：2012年"}"""
@@ -235,45 +236,70 @@ async def generate_ads(car_info: str) -> dict:
     import random
 
     variations = [
-        "コンテナ発送対応・まとめ購入歓迎の視点で",
-        "中古部品も同時発送可能な事業者向けの視点で",
-        "タイヤ・ホイール・エンジン部品もセット販売可能な視点で",
-        "バンパー・外装部品・内装部品も一括輸出可能な視点で",
-        "海外バイヤー向けの卸売・まとめ買い歓迎の視点で",
+        {
+            "theme": "dealer_sourcing",
+            "desc": "日本から世界の業者向けに車を供給している業者として。忙しく仕入れている雰囲気で。"
+        },
+        {
+            "theme": "container_shipping",
+            "desc": "コンテナ発送・まとめ購入対応をアピール。海外業者へのBtoB供給者として。"
+        },
+        {
+            "theme": "auction_quality",
+            "desc": "日本オークション直仕入れの品質をアピール。クリーンな車・評価点をアピール。"
+        },
+        {
+            "theme": "wholesale_price",
+            "desc": "業者価格・卸売対応をアピール。大量購入・リピート業者歓迎の雰囲気で。"
+        },
+        {
+            "theme": "parts_bundle",
+            "desc": "タイヤ・エンジン部品・外装部品も同時発送可能な総合輸出業者として。"
+        },
     ]
     variation = random.choice(variations)
 
-    prompt = f"""あなたは国際中古車・部品輸出の事業者向けSNS広告のプロです。
+    prompt = f"""あなたは在日本の中古車輸出業者として、海外の車ディーラー・業者向けにSNS広告を作成するプロです。
 
-【今回の広告の切り口】
-{variation}
+【今回の広告テーマ】
+{variation["desc"]}
+
+【参考にすべきトーン・スタイル】
+- 短くて力強い業者向けメッセージ
+- 英語と中国語（または現地語）を組み合わせるスタイル
+- ハッシュタグは業界向け（#japanusedcars #carexport #cardealer #japanauction など）
+- 例文スタイル：
+  "Japanese used cars ready for export 🚗 / Good condition / auction grade cars / Dealers welcome."
+  "日本二手车出口 / 车况好 / 拍卖车源 / 车商合作欢迎联系"
+  "Busy day sourcing cars for my clients 🚗 / Direct from Japan auction / Dealers welcome."
+  "Container shipping available / 可装柜发货"
+  "Wholesale cars from Japan / 日本批发二手车 / 欢迎联系"
 
 【厳守ルール】
 1. 価格・金額は絶対に書かない
-2. オークション・仕入先は書かない
+2. オークション名・仕入先は書かない
 3. 必ず有効なJSONのみ返す
-4. 事業者・バイヤー向けのプロフェッショナルなトーンで
-5. 必ず全5言語（ja/zh/en/ru/fr）全て生成すること
-6. JSON以外の説明文は一切書かない
+4. 全5言語（ja/zh/en/ru/fr）全て生成すること
+5. JSON以外の説明文は一切書かない
+6. コードブロック（```）は使わない
 7. キー名も値も必ずダブルクォートを使う
-8. コードブロック（```）は使わない
 
 【車情報】
 {car_info}
 
-【対応可能なサービス（広告に自然に含める）】
-- コンテナ発送・まとめ購入対応
-- 中古タイヤ・ホイール同時発送可
-- エンジン・ミッション部品も取扱
-- バンパー・外装・内装部品も一括輸出可
-- 世界各地への輸出実績あり
+【対応サービス（自然に含める）】
+- Container shipping available / コンテナ発送対応
+- Parts also available: tires, engines, bumpers / 部品も同時発送可
+- Wholesale / dealer price / 卸売・業者価格対応
+- Direct from Japan auction / 日本オークション直仕入れ
+- Worldwide export / 世界各地への輸出実績
 
 【各SNSの仕様】
-X(Twitter): 全角140文字以内、ハッシュタグ3〜5個、力強く簡潔
-Facebook: 全角300〜500文字、ハッシュタグ3〜5個、ストーリー調絵文字使用
-TikTok: 全角300〜500文字、ハッシュタグ3〜5個、エネルギッシュ
-Instagram: 全角300〜350文字、ハッシュタグ3〜5個、ライフスタイル訴求
-小紅書: 必ず中国語、全角300〜500文字、#标签形式、日記風絵文字多め
+X(Twitter): 140文字以内、ハッシュタグ3〜5個、短く力強く
+Facebook: 300〜500文字、ハッシュタグ3〜5個、業者向けストーリー調
+TikTok: 300〜500文字、ハッシュタグ3〜5個、エネルギッシュ
+Instagram: 300〜350文字、ハッシュタグ3〜5個、プロフェッショナル
+小紅書: 必ず中国語、300〜500文字、#标签形式、業者向け
 
 必ず以下のJSON形式で返してください：
 {{"ja":{{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."}},"zh":{{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."}},"en":{{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."}},"ru":{{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."}},"fr":{{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."}}}}"""
@@ -304,34 +330,7 @@ def upload_to_drive(service, file_bytes: bytes, filename: str, folder_id: str, m
     service.files().create(body=file_metadata, media_body=media, fields="id").execute()
 
 
-def format_ads_by_language(ads_dict: dict) -> str:
-    """言語ごとに全SNSの広告をまとめる"""
-    platforms = [
-        ("x", "X (Twitter)"),
-        ("fb", "Facebook"),
-        ("tt", "TikTok"),
-        ("ig", "Instagram"),
-        ("xhs", "小紅書"),
-    ]
-    languages = [
-        ("ja", "🇯🇵 日本語"),
-        ("zh", "🇨🇳 中国語"),
-        ("en", "🇬🇧 English"),
-        ("ru", "🇷🇺 Русский"),
-        ("fr", "🇫🇷 Français"),
-    ]
-
-    text = ""
-    for lang_key, lang_name in languages:
-        text += f"\n{'='*25}\n{lang_name}\n{'='*25}\n\n"
-        for platform_key, platform_name in platforms:
-            content = ads_dict.get(lang_key, {}).get(platform_key, "")
-            text += f"【{platform_name}】\n{content}\n\n"
-    return text.strip()
-
-
 def format_ads_for_drive(ads_dict: dict, car_info: str) -> str:
-    """Drive保存用：言語ごとにまとめる"""
     platforms = [
         ("x", "X (Twitter)"),
         ("fb", "Facebook"),
@@ -346,7 +345,6 @@ def format_ads_for_drive(ads_dict: dict, car_info: str) -> str:
         ("ru", "Русский"),
         ("fr", "Français"),
     ]
-
     text = f"【車情報】\n{car_info}\n\n"
     for lang_key, lang_name in languages:
         text += f"\n{'='*30}\n{lang_name}\n{'='*30}\n\n"
@@ -358,8 +356,6 @@ def format_ads_for_drive(ads_dict: dict, car_info: str) -> str:
 
 async def process_photos(chat_id: int, file_ids: list):
     try:
-        print("process_photos start")
-
         images = []
         for file_id in file_ids:
             img_bytes = await get_image_content(file_id)
@@ -374,8 +370,7 @@ async def process_photos(chat_id: int, file_ids: list):
         # オークションシートを特定
         auction_sheet = None
         for img in images:
-            is_auction = await identify_auction_sheet(img)
-            if is_auction:
+            if await identify_auction_sheet(img):
                 auction_sheet = img
                 break
         if auction_sheet is None:
@@ -386,10 +381,11 @@ async def process_photos(chat_id: int, file_ids: list):
         model_code = car_data.get("model_code", "unknown")
         car_info = car_data.get("car_info", "")
         safe_model_code = re.sub(r'[\\/:*?"<>|]+', "_", str(model_code)).strip() or "unknown"
+        folder_name = f"{datetime.now().strftime('%Y%m%d')}_{safe_model_code}"
 
         # Google Drive保存
         drive_ok = False
-        folder_name = f"{datetime.now().strftime('%Y%m%d')}_{safe_model_code}"
+        folder_id = None
         try:
             drive_service = get_drive_service()
             folder_id = create_drive_folder(drive_service, folder_name, GOOGLE_DRIVE_FOLDER_ID)
@@ -397,14 +393,14 @@ async def process_photos(chat_id: int, file_ids: list):
                 upload_to_drive(drive_service, img_bytes, f"photo_{i+1}.jpg", folder_id)
             drive_ok = True
             print("Drive folder created:", folder_name)
-        except Exception as drive_err:
-            print(f"Drive error: {drive_err}")
+        except Exception as e:
+            print(f"Drive error: {e}")
 
         # 広告文生成
         ads_dict = await generate_ads(car_info)
 
         # Drive に広告文保存
-        if drive_ok:
+        if drive_ok and folder_id:
             try:
                 ads_text = format_ads_for_drive(ads_dict, car_info)
                 upload_to_drive(
@@ -414,16 +410,12 @@ async def process_photos(chat_id: int, file_ids: list):
                     folder_id,
                     mime_type="text/plain"
                 )
-                print("Ads text uploaded to Drive")
             except Exception as e:
                 print(f"Drive ads upload error: {e}")
 
-        # Telegramに送信（言語ごと）
-        header = (
-            f"✅ 完了 📁 {folder_name}\n\n"
-            f"【車情報】\n{car_info}"
-        )
-        await send_message(chat_id, header)
+        # Telegramに送信
+        drive_status = f"📁 {folder_name}" if drive_ok else "⚠️ Drive保存失敗"
+        await send_message(chat_id, f"✅ 完了 {drive_status}\n\n【車情報】\n{car_info}")
 
         # 言語ごとに送信
         languages = [
@@ -434,7 +426,7 @@ async def process_photos(chat_id: int, file_ids: list):
             ("fr", "🇫🇷 Français"),
         ]
         platforms = [
-            ("x", "X (Twitter)"),
+            ("x", "X"),
             ("fb", "Facebook"),
             ("tt", "TikTok"),
             ("ig", "Instagram"),
@@ -453,7 +445,7 @@ async def process_photos(chat_id: int, file_ids: list):
         user_timers.pop(chat_id, None)
 
     except Exception as e:
-        print(f"Error in process_photos: {e}")
+        print(f"Error: {e}")
         await send_message(chat_id, f"❌ エラー: {str(e)}")
         user_buffers.pop(chat_id, None)
         user_timers.pop(chat_id, None)
@@ -490,7 +482,7 @@ async def webhook(request: Request):
         timer = asyncio.create_task(delayed_process(chat_id))
         user_timers[chat_id] = timer
 
-        await send_message(chat_id, "📩 写真を受け取りました。解析を開始します...")
+        await send_message(chat_id, "📩 写真受信。解析中...")
 
     elif "text" in message:
         text = message["text"].strip().upper()
@@ -498,14 +490,11 @@ async def webhook(request: Request):
             await send_message(
                 chat_id,
                 "🚗 車広告自動生成Bot\n\n"
-                "【使い方】\n"
-                "写真を送るだけで自動処理！\n"
-                "（オークションシート＋車体写真）\n\n"
-                "【出力】\n"
-                "言語ごとに5SNS分の広告文\n"
-                "Google Driveに自動保存\n\n"
-                "【言語】🇯🇵 🇨🇳 🇬🇧 🇷🇺 🇫🇷\n"
-                "【SNS】X/FB/TikTok/IG/小紅書"
+                "写真を送るだけで自動処理！\n\n"
+                "【出力】業者向け広告\n"
+                "🇯🇵 🇨🇳 🇬🇧 🇷🇺 🇫🇷\n"
+                "X / FB / TikTok / IG / 小紅書\n"
+                "Google Driveに自動保存"
             )
 
     return JSONResponse(content={"status": "ok"})
