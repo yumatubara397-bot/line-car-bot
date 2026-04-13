@@ -2,7 +2,7 @@
 Telegram Bot - 車オークションシート自動広告生成
 Claude API (Anthropic) 使用
 複数写真から自動でオークションシートを判別して広告生成
-Google Driveにフォルダ分けして保存
+Google Drive（共有ドライブ対応）に保存
 """
 
 import os
@@ -33,7 +33,7 @@ user_buffers = {}
 user_timers = {}
 
 # ============================================================
-# Google Drive
+# Google Drive（共有ドライブ対応）
 # ============================================================
 def get_drive_service():
     creds_json = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
@@ -43,22 +43,48 @@ def get_drive_service():
     )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-def create_drive_folder(service, folder_name, parent_id):
+def verify_parent_folder(service, folder_id: str) -> bool:
+    """親フォルダにアクセスできるか確認"""
+    try:
+        service.files().get(
+            fileId=folder_id,
+            supportsAllDrives=True,
+            fields="id,name,mimeType"
+        ).execute()
+        return True
+    except Exception as e:
+        print(f"[Drive] 親フォルダアクセス失敗 folder_id={folder_id}: {e}")
+        return False
+
+def create_drive_folder(service, folder_name: str, parent_id: str) -> str:
+    """共有ドライブ内にサブフォルダを作成"""
     meta = {
         "name": folder_name,
         "mimeType": "application/vnd.google-apps.folder",
         "parents": [parent_id]
     }
-    folder = service.files().create(body=meta, fields="id").execute()
+    folder = service.files().create(
+        body=meta,
+        fields="id",
+        supportsAllDrives=True       # ← 共有ドライブ対応
+    ).execute()
+    print(f"[Drive] フォルダ作成: {folder_name} -> {folder['id']}")
     return folder["id"]
 
-def upload_text_to_drive(service, folder_id, filename, content):
+def upload_text_to_drive(service, folder_id: str, filename: str, content: str):
+    """テキストファイルを共有ドライブ内フォルダにアップロード"""
     media = MediaIoBaseUpload(
         io.BytesIO(content.encode("utf-8")),
         mimetype="text/plain; charset=utf-8"
     )
     meta = {"name": filename, "parents": [folder_id]}
-    service.files().create(body=meta, media_body=media, fields="id").execute()
+    service.files().create(
+        body=meta,
+        media_body=media,
+        fields="id",
+        supportsAllDrives=True       # ← 共有ドライブ対応
+    ).execute()
+    print(f"[Drive] ファイル保存: {filename}")
 
 # ============================================================
 # Telegram API
@@ -92,14 +118,19 @@ async def find_auction_sheet(images_b64: list) -> int:
         return 0
 
     content = []
-    for i, img_b64 in enumerate(images_b64):
+    for img_b64 in images_b64:
         content.append({
             "type": "image",
             "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}
         })
     content.append({
         "type": "text",
-        "text": f"These are {len(images_b64)} images. Which image is a Japanese car auction sheet (出品表/オークションシート)? It typically has inspection grades, mileage, car condition marks, and vehicle details in Japanese. Reply with ONLY a single number (0-based index). If none is clearly an auction sheet, reply 0."
+        "text": (
+            f"These are {len(images_b64)} images. "
+            "Which image is a Japanese car auction sheet (出品表/オークションシート)? "
+            "It typically has inspection grades, mileage, car condition marks, and vehicle details in Japanese. "
+            "Reply with ONLY a single number (0-based index). If none is clearly an auction sheet, reply 0."
+        )
     })
 
     payload = {
@@ -120,7 +151,7 @@ async def find_auction_sheet(images_b64: list) -> int:
         try:
             idx = int(text)
             return min(idx, len(images_b64) - 1)
-        except:
+        except Exception:
             return 0
 
 # ============================================================
@@ -133,7 +164,7 @@ async def generate_ads(image_bytes: bytes) -> dict:
 
 STRICT RULES (NEVER VIOLATE):
 1. NEVER mention price, cost, or any monetary values
-2. NEVER mention auction house, supplier, or acquisition source  
+2. NEVER mention auction house, supplier, or acquisition source
 3. NEVER include VIN, chassis number, or license plate
 4. Return ONLY valid JSON — no markdown, no explanation
 
@@ -141,11 +172,11 @@ Required JSON format (ALL 5 languages, ALL 5 platforms):
 {"ja":{"x":"","fb":"","tt":"","xhs":"","ig":""},"zh":{"x":"","fb":"","tt":"","xhs":"","ig":""},"en":{"x":"","fb":"","tt":"","xhs":"","ig":""},"ru":{"x":"","fb":"","tt":"","xhs":"","ig":""},"fr":{"x":"","fb":"","tt":"","xhs":"","ig":""}}
 
 PLATFORM RULES:
-[x] 120 chars max + 3-5 hashtags. Single punchy line.
-[fb] 200-400 chars + 3-5 hashtags. Warm, 2-3 paragraphs with emojis.
-[tt] 100-200 chars + 5-8 hashtags. Energetic, trendy hook.
+[x]   120 chars max + 3-5 hashtags. Single punchy line.
+[fb]  200-400 chars + 3-5 hashtags. Warm, 2-3 paragraphs with emojis.
+[tt]  100-200 chars + 5-8 hashtags. Energetic, trendy hook.
 [xhs] ALWAYS Chinese regardless of language key. 200-400 chars + 5 Chinese #hashtags. Lifestyle diary with emojis.
-[ig] 150-250 chars + 15-25 hashtags on new line. Aesthetic, aspirational."""
+[ig]  150-250 chars + 15-25 hashtags on new line. Aesthetic, aspirational."""
 
     payload = {
         "model": "claude-haiku-4-5-20251001",
@@ -165,7 +196,12 @@ PLATFORM RULES:
                     },
                     {
                         "type": "text",
-                        "text": "This is a Japanese car auction sheet. Read all car details (make, model, year, mileage, grade, color, features). Generate ads for all 5 languages × 5 platforms. Return ONLY the JSON object, nothing else."
+                        "text": (
+                            "This is a Japanese car auction sheet. "
+                            "Read all car details (make, model, year, mileage, grade, color, features). "
+                            "Generate ads for all 5 languages × 5 platforms. "
+                            "Return ONLY the JSON object, nothing else."
+                        )
                     }
                 ]
             }
@@ -187,16 +223,16 @@ PLATFORM RULES:
 
         # JSONフェンス除去
         if "```" in raw:
-            parts = raw.split("```")
-            for part in parts:
-                if part.startswith("json"):
-                    raw = part[4:].strip()
+            for part in raw.split("```"):
+                p = part.strip()
+                if p.startswith("json"):
+                    raw = p[4:].strip()
                     break
-                elif part.strip().startswith("{"):
-                    raw = part.strip()
+                elif p.startswith("{"):
+                    raw = p
                     break
 
-        # JSON開始・終了を探す
+        # JSON開始・終了を抽出
         start = raw.find("{")
         end = raw.rfind("}") + 1
         if start >= 0 and end > start:
@@ -207,35 +243,33 @@ PLATFORM RULES:
 # ============================================================
 # メイン処理
 # ============================================================
-SNS_NAMES = {"x": "X(Twitter)", "fb": "Facebook", "tt": "TikTok", "xhs": "小紅書", "ig": "Instagram"}
+SNS_NAMES  = {"x": "X(Twitter)", "fb": "Facebook", "tt": "TikTok", "xhs": "小紅書", "ig": "Instagram"}
 LANG_NAMES = {"ja": "🇯🇵 日本語", "zh": "🇨🇳 中国語", "en": "🇬🇧 English", "ru": "🇷🇺 Русский", "fr": "🇫🇷 Français"}
 
 async def process_photos(chat_id: int, file_ids: list):
     try:
         await send_message(chat_id, f"📷 {len(file_ids)}枚受信\n🔍 オークションシートを解析中... (約30秒)")
 
-        # 全画像をダウンロード
+        # 全画像ダウンロード
         images = []
         for fid in file_ids:
             url = await get_file_url(fid)
             img_bytes = await download_image(url)
             images.append(img_bytes)
-            print(f"Downloaded image: {len(img_bytes)} bytes")
+            print(f"Downloaded: {len(img_bytes)} bytes")
 
-        # オークションシートを判別
+        # オークションシート判別
         if len(images) > 1:
             images_b64 = [base64.standard_b64encode(img).decode("utf-8") for img in images]
             sheet_idx = await find_auction_sheet(images_b64)
-            print(f"Auction sheet index: {sheet_idx}")
         else:
             sheet_idx = 0
-
-        auction_image = images[sheet_idx]
+        print(f"Auction sheet index: {sheet_idx}")
 
         # 広告生成
-        ads = await generate_ads(auction_image)
+        ads = await generate_ads(images[sheet_idx])
 
-        # Google Driveに保存
+        # ── Google Drive 保存 ──────────────────────────────
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
         folder_name = f"car_ad_{now}"
         drive_saved = False
@@ -243,6 +277,15 @@ async def process_photos(chat_id: int, file_ids: list):
 
         try:
             drive = get_drive_service()
+
+            # 親フォルダの疎通確認
+            if not verify_parent_folder(drive, GDRIVE_FOLDER_ID):
+                raise Exception(
+                    f"親フォルダ(ID:{GDRIVE_FOLDER_ID})にアクセスできません。\n"
+                    "・フォルダIDが正しいか確認してください\n"
+                    "・サービスアカウントを「編集者」で共有してください"
+                )
+
             sub_folder_id = create_drive_folder(drive, folder_name, GDRIVE_FOLDER_ID)
 
             for lang_code, lang_name in LANG_NAMES.items():
@@ -253,17 +296,16 @@ async def process_photos(chat_id: int, file_ids: list):
                     txt = ads[lang_code].get(sns_code, "")
                     if txt:
                         lines.append(f"【{sns_name}】\n{txt}\n")
-                content = "\n".join(lines)
-                upload_text_to_drive(drive, sub_folder_id, f"{lang_code}.txt", content)
+                upload_text_to_drive(drive, sub_folder_id, f"{lang_code}.txt", "\n".join(lines))
 
             drive_saved = True
-            print("Drive save: OK")
+
         except Exception as e:
             drive_error = str(e)
-            print(f"Drive error: {e}")
+            print(f"[Drive] ERROR: {e}")
 
         # 完了通知
-        drive_status = "✅ Google Drive保存完了" if drive_saved else f"⚠️ Drive保存失敗\n({drive_error[:80]})"
+        drive_status = "✅ Google Drive保存完了" if drive_saved else f"⚠️ Drive保存失敗\n{drive_error[:120]}"
         await send_message(
             chat_id,
             f"✅ 広告生成完了！\n"
@@ -311,7 +353,6 @@ async def webhook(request: Request):
             user_buffers[chat_id] = []
         user_buffers[chat_id].append(file_id)
 
-        # タイマーリセット（5秒間待って一括処理）
         if chat_id in user_timers:
             user_timers[chat_id].cancel()
         timer = asyncio.create_task(delayed_process(chat_id))
