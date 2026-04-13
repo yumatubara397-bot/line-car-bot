@@ -1,8 +1,10 @@
 """
 Telegram Bot - 車オークションシート自動広告生成
 Claude API (Anthropic) 使用
-複数写真から自動でオークションシートを判別して広告生成
-Google Drive（共有ドライブ対応）に保存
+- 複数写真から自動でオークションシートを判別
+- フォルダ名: 日付_車名
+- 写真（全枚）もDriveに保存
+- Google Drive（共有ドライブ対応）
 """
 
 import os
@@ -44,7 +46,6 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def verify_parent_folder(service, folder_id: str) -> bool:
-    """親フォルダにアクセスできるか確認"""
     try:
         service.files().get(
             fileId=folder_id,
@@ -53,11 +54,10 @@ def verify_parent_folder(service, folder_id: str) -> bool:
         ).execute()
         return True
     except Exception as e:
-        print(f"[Drive] 親フォルダアクセス失敗 folder_id={folder_id}: {e}")
+        print(f"[Drive] 親フォルダアクセス失敗: {e}")
         return False
 
 def create_drive_folder(service, folder_name: str, parent_id: str) -> str:
-    """共有ドライブ内にサブフォルダを作成"""
     meta = {
         "name": folder_name,
         "mimeType": "application/vnd.google-apps.folder",
@@ -66,13 +66,12 @@ def create_drive_folder(service, folder_name: str, parent_id: str) -> str:
     folder = service.files().create(
         body=meta,
         fields="id",
-        supportsAllDrives=True       # ← 共有ドライブ対応
+        supportsAllDrives=True
     ).execute()
     print(f"[Drive] フォルダ作成: {folder_name} -> {folder['id']}")
     return folder["id"]
 
 def upload_text_to_drive(service, folder_id: str, filename: str, content: str):
-    """テキストファイルを共有ドライブ内フォルダにアップロード"""
     media = MediaIoBaseUpload(
         io.BytesIO(content.encode("utf-8")),
         mimetype="text/plain; charset=utf-8"
@@ -82,9 +81,23 @@ def upload_text_to_drive(service, folder_id: str, filename: str, content: str):
         body=meta,
         media_body=media,
         fields="id",
-        supportsAllDrives=True       # ← 共有ドライブ対応
+        supportsAllDrives=True
     ).execute()
-    print(f"[Drive] ファイル保存: {filename}")
+    print(f"[Drive] テキスト保存: {filename}")
+
+def upload_image_to_drive(service, folder_id: str, filename: str, image_bytes: bytes):
+    media = MediaIoBaseUpload(
+        io.BytesIO(image_bytes),
+        mimetype="image/jpeg"
+    )
+    meta = {"name": filename, "parents": [folder_id]}
+    service.files().create(
+        body=meta,
+        media_body=media,
+        fields="id",
+        supportsAllDrives=True
+    ).execute()
+    print(f"[Drive] 画像保存: {filename}")
 
 # ============================================================
 # Telegram API
@@ -110,13 +123,13 @@ async def download_image(url: str) -> bytes:
         return r.content
 
 # ============================================================
-# Step1: オークションシートを判別
+# Step1: オークションシート判別 + 車名抽出
 # ============================================================
-async def find_auction_sheet(images_b64: list) -> int:
-    """複数画像からオークションシートのインデックスを返す"""
-    if len(images_b64) == 1:
-        return 0
-
+async def find_auction_sheet_and_car_name(images_b64: list) -> tuple[int, str]:
+    """
+    複数画像からオークションシートのインデックスと車名を返す
+    戻り値: (sheet_index, car_name)
+    """
     content = []
     for img_b64 in images_b64:
         content.append({
@@ -126,16 +139,18 @@ async def find_auction_sheet(images_b64: list) -> int:
     content.append({
         "type": "text",
         "text": (
-            f"These are {len(images_b64)} images. "
-            "Which image is a Japanese car auction sheet (出品表/オークションシート)? "
-            "It typically has inspection grades, mileage, car condition marks, and vehicle details in Japanese. "
-            "Reply with ONLY a single number (0-based index). If none is clearly an auction sheet, reply 0."
+            f"There are {len(images_b64)} images. "
+            "Find the Japanese car auction sheet (出品表/オークションシート) among them. "
+            "It has inspection grades, mileage, condition marks, and vehicle details in Japanese. "
+            "Then read the car name (メーカー名＋車種名, e.g. トヨタ ノア, ホンダ フィット, 日産 セレナ) from that sheet. "
+            "Reply in this exact JSON format only, no other text: "
+            '{\"index\": 0, \"car_name\": \"トヨタ ノア\"}'
         )
     })
 
     payload = {
         "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 10,
+        "max_tokens": 50,
         "messages": [{"role": "user", "content": content}]
     }
     headers = {
@@ -144,15 +159,26 @@ async def find_auction_sheet(images_b64: list) -> int:
         "content-type": "application/json"
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(CLAUDE_API, headers=headers, json=payload)
-        data = r.json()
-        text = data["content"][0]["text"].strip()
-        try:
-            idx = int(text)
-            return min(idx, len(images_b64) - 1)
-        except Exception:
-            return 0
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(CLAUDE_API, headers=headers, json=payload)
+            data = r.json()
+            raw = data["content"][0]["text"].strip()
+            print(f"[Sheet detect] {raw}")
+
+            # JSON抽出
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start >= 0 and end > start:
+                parsed = json.loads(raw[start:end])
+                idx = int(parsed.get("index", 0))
+                car_name = str(parsed.get("car_name", "不明")).strip()
+                idx = min(idx, len(images_b64) - 1)
+                return idx, car_name
+    except Exception as e:
+        print(f"[Sheet detect] error: {e}")
+
+    return 0, "不明"
 
 # ============================================================
 # Step2: 広告文生成
@@ -221,7 +247,6 @@ PLATFORM RULES:
         raw = data["content"][0]["text"].strip()
         print(f"Raw response length: {len(raw)}")
 
-        # JSONフェンス除去
         if "```" in raw:
             for part in raw.split("```"):
                 p = part.strip()
@@ -232,7 +257,6 @@ PLATFORM RULES:
                     raw = p
                     break
 
-        # JSON開始・終了を抽出
         start = raw.find("{")
         end = raw.rfind("}") + 1
         if start >= 0 and end > start:
@@ -258,27 +282,27 @@ async def process_photos(chat_id: int, file_ids: list):
             images.append(img_bytes)
             print(f"Downloaded: {len(img_bytes)} bytes")
 
-        # オークションシート判別
-        if len(images) > 1:
-            images_b64 = [base64.standard_b64encode(img).decode("utf-8") for img in images]
-            sheet_idx = await find_auction_sheet(images_b64)
-        else:
-            sheet_idx = 0
-        print(f"Auction sheet index: {sheet_idx}")
+        # オークションシート判別 + 車名取得（1回のAPIで両方）
+        images_b64 = [base64.standard_b64encode(img).decode("utf-8") for img in images]
+        sheet_idx, car_name = await find_auction_sheet_and_car_name(images_b64)
+        print(f"Sheet index: {sheet_idx}, Car name: {car_name}")
 
         # 広告生成
         ads = await generate_ads(images[sheet_idx])
 
+        # フォルダ名: 日付_車名（スペースをアンダースコアに）
+        date_str = datetime.now().strftime("%Y%m%d")
+        safe_car_name = car_name.replace(" ", "_").replace("/", "_").replace("　", "_")
+        folder_name = f"{date_str}_{safe_car_name}"
+
         # ── Google Drive 保存 ──────────────────────────────
-        now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        folder_name = f"car_ad_{now}"
         drive_saved = False
         drive_error = ""
 
         try:
             drive = get_drive_service()
 
-            # 親フォルダの疎通確認
+            # 親フォルダ疎通確認
             if not verify_parent_folder(drive, GDRIVE_FOLDER_ID):
                 raise Exception(
                     f"親フォルダ(ID:{GDRIVE_FOLDER_ID})にアクセスできません。\n"
@@ -288,6 +312,17 @@ async def process_photos(chat_id: int, file_ids: list):
 
             sub_folder_id = create_drive_folder(drive, folder_name, GDRIVE_FOLDER_ID)
 
+            # ① 写真を全枚保存
+            for i, img_bytes in enumerate(images):
+                if i == sheet_idx:
+                    img_filename = f"01_auction_sheet.jpg"
+                else:
+                    # 車体写真は連番で保存
+                    car_num = i if i < sheet_idx else i  # sheet以外の順番
+                    img_filename = f"car_photo_{i:02d}.jpg"
+                upload_image_to_drive(drive, sub_folder_id, img_filename, img_bytes)
+
+            # ② 広告テキストを言語ごとに保存
             for lang_code, lang_name in LANG_NAMES.items():
                 if lang_code not in ads:
                     continue
@@ -303,14 +338,18 @@ async def process_photos(chat_id: int, file_ids: list):
         except Exception as e:
             drive_error = str(e)
             print(f"[Drive] ERROR: {e}")
+            import traceback
+            traceback.print_exc()
 
         # 完了通知
         drive_status = "✅ Google Drive保存完了" if drive_saved else f"⚠️ Drive保存失敗\n{drive_error[:120]}"
         await send_message(
             chat_id,
             f"✅ 広告生成完了！\n"
+            f"🚗 {car_name}\n"
             f"📁 {folder_name}\n"
             f"🌐 5言語 × 5SNS = 25種類\n"
+            f"📷 写真 {len(images)}枚保存\n"
             f"{drive_status}"
         )
 
@@ -373,6 +412,7 @@ async def webhook(request: Request):
                 "× X / Facebook / TikTok / 小紅書 / Instagram\n"
                 "= 25種類の広告文\n\n"
                 "✅ Google Driveに自動保存\n"
+                "（写真＋広告文テキスト）\n"
                 "※仕入先・価格は自動で除外"
             )
 
