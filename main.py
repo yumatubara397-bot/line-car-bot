@@ -1,7 +1,8 @@
 """
 Telegram Bot - 車オークションシート自動広告生成
-Google Gemini API + Google Drive保存
-写真を送るだけで広告文を生成し、Googleドライブに自動保存
+Claude API (Anthropic) 使用
+5言語 × 5SNS = 25種類の広告文を生成
+Google Driveにフォルダ分けして保存
 """
 
 import os
@@ -9,29 +10,31 @@ import json
 import base64
 import asyncio
 import httpx
-import io
-from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+import io
+from datetime import datetime
 
 app = FastAPI()
 
-# ============================================================
-# 環境変数
-# ============================================================
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "0ANll_6Bs9PULUk9PVA")
+GDRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"
+TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
+CLAUDE_API = "https://api.anthropic.com/v1/messages"
+
+# ユーザーごとの写真バッファとタイマー
+user_buffers = {}
+user_timers = {}
 
 # ============================================================
-# Google Drive クライアント
+# Google Drive
 # ============================================================
 def get_drive_service():
     creds_json = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
@@ -41,11 +44,28 @@ def get_drive_service():
     )
     return build("drive", "v3", credentials=creds)
 
+def create_drive_folder(service, folder_name, parent_id):
+    meta = {
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id]
+    }
+    folder = service.files().create(body=meta, fields="id").execute()
+    return folder["id"]
+
+def upload_text_to_drive(service, folder_id, filename, content):
+    media = MediaIoBaseUpload(
+        io.BytesIO(content.encode("utf-8")),
+        mimetype="text/plain"
+    )
+    meta = {"name": filename, "parents": [folder_id]}
+    service.files().create(body=meta, media_body=media, fields="id").execute()
+
 # ============================================================
-# Telegram APIヘルパー
+# Telegram API
 # ============================================================
 async def send_message(chat_id: int, text: str):
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient() as client:
         r = await client.post(
             f"{TELEGRAM_API}/sendMessage",
             json={"chat_id": chat_id, "text": text}
@@ -53,236 +73,150 @@ async def send_message(chat_id: int, text: str):
         print(f"send_message: {r.status_code}")
 
 async def get_file_url(file_id: str) -> str:
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient() as client:
         r = await client.get(f"{TELEGRAM_API}/getFile?file_id={file_id}")
         data = r.json()
         file_path = data["result"]["file_path"]
-        return f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+        return f"{TELEGRAM_FILE_API}/{file_path}"
 
-async def download_file(url: str) -> bytes:
-    async with httpx.AsyncClient(timeout=30.0) as client:
+async def download_image(url: str) -> bytes:
+    async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(url)
         return r.content
 
 # ============================================================
-# Gemini API
+# Claude API で広告文生成
 # ============================================================
-async def call_gemini_vision(image_bytes: bytes, prompt: str) -> str:
-    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        res = await client.post(
-            f"{GEMINI_API}?key={GEMINI_API_KEY}",
-            headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{
-                    "parts": [
-                        {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
-                        {"text": prompt}
-                    ]
-                }],
-                "generationConfig": {"maxOutputTokens": 1000, "temperature": 0.3}
+async def generate_ads(image_bytes: bytes) -> dict:
+    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+    system_prompt = """You are an expert automotive marketing copywriter for international social media.
+
+STRICT RULES (NEVER VIOLATE):
+1. NEVER mention price, cost, or any monetary values
+2. NEVER mention auction house, supplier, or acquisition source
+3. NEVER include VIN, chassis number, or license plate
+4. Return ONLY valid JSON — no markdown fences, no explanation text
+
+Required JSON format:
+{"ja":{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."},"zh":{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."},"en":{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."},"ru":{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."},"fr":{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."}}
+
+=== PLATFORM SPECIFICATIONS ===
+
+[X (Twitter)] Max 140 chars body + 3-5 hashtags on new line. Punchy, one hook.
+[Facebook] 300-500 chars + 3-5 hashtags. Warm, storytelling, emojis, 2-3 paragraphs.
+[TikTok] 150-300 chars + 5-10 hashtags. Energetic, trendy, hook in first line.
+[小紅書 xhs] ALWAYS Chinese in ALL languages. 300-500 chars + 5-10 Chinese hashtags. Lifestyle diary style with emojis.
+[Instagram] 200-300 chars + 20-30 hashtags in separate block. Aesthetic, aspirational.
+
+Languages: ja=Japanese, zh=Chinese, en=English, ru=Russian, fr=French"""
+
+    payload = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 4000,
+        "system": system_prompt,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_b64
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": "This is a Japanese car auction sheet. Extract the car info and generate ads in all 5 languages for all 5 platforms. Return ONLY JSON."
+                    }
+                ]
             }
-        )
-        data = res.json()
-        print(f"Gemini vision: {json.dumps(data)[:200]}")
-        if "error" in data:
-            raise Exception(data["error"]["message"])
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-async def call_gemini_text(prompt: str) -> str:
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        res = await client.post(
-            f"{GEMINI_API}?key={GEMINI_API_KEY}",
-            headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": 4000, "temperature": 0.7}
-            }
-        )
-        data = res.json()
-        print(f"Gemini text: {json.dumps(data)[:200]}")
-        if "error" in data:
-            raise Exception(data["error"]["message"])
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-# ============================================================
-# 車情報抽出
-# ============================================================
-async def extract_car_info(image_bytes: bytes) -> str:
-    prompt = """このオークションシートの画像から車の情報を読み取り、以下の形式でまとめてください。
-
-【除外する情報（絶対に含めない）】
-- オークション名・仕入先・出品者情報
-- 価格・R券・落札金額などの金額情報
-- 車台番号・登録番号・バーコード番号
-
-【抽出する情報】
-- メーカー・ブランド
-- モデル名・グレード
-- 年式、走行距離、排気量
-- ミッション種類（AT/MT）
-- ボディカラー
-- 主要装備・オプション
-- 車検有効期限
-- 修復歴の有無
-- 状態・コンディション（外装・内装グレード）
-- その他特記事項
-
-日本語の箇条書きで出力してください。"""
-    return await call_gemini_vision(image_bytes, prompt)
-
-# ============================================================
-# 車種名を短く取得（フォルダ名用）
-# ============================================================
-async def get_car_name(car_info: str) -> str:
-    prompt = f"""以下の車情報から「メーカー名 モデル名」だけを短く抽出してください。
-例：「スズキ スペーシア」「トヨタ ランドクルーザー」「ホンダ フィット」
-20文字以内で、他の情報は一切含めないでください。
-
-車情報：
-{car_info}"""
-    try:
-        name = await call_gemini_text(prompt)
-        # ファイル名に使えない文字を除去
-        name = name.strip().replace("/", "").replace("\\", "").replace(":", "").replace("*", "").replace("?", "").replace('"', "").replace("<", "").replace(">", "").replace("|", "")
-        return name[:30]
-    except:
-        return "不明車種"
-
-# ============================================================
-# 広告文生成
-# ============================================================
-async def generate_ads(car_info: str) -> dict:
-    prompt = f"""あなたは国際的なSNS広告のプロのコピーライターです。
-
-【厳守ルール】
-1. 価格・金額は絶対に書かない
-2. オークション・仕入先・入手経路は絶対に書かない
-3. 車台番号・登録番号は書かない
-4. JSONのみ返す（```不要）
-
-【車情報】
-{car_info}
-
-【各SNSの仕様】
-X(Twitter): 本文全角140文字以内、ハッシュタグ3〜5個（末尾改行）、力強く簡潔
-Facebook: 本文全角300〜500文字、ハッシュタグ3〜5個（末尾改行）、ストーリー調絵文字使用
-TikTok: 本文全角300〜500文字、ハッシュタグ3〜5個（末尾改行）、エネルギッシュ・トレンド感
-Instagram: 本文全角300〜350文字、ハッシュタグ3〜5個（末尾改行）、ライフスタイル訴求絵文字使用
-小紅書: 全セクション必ず中国語、本文全角300〜500文字、#标签形式3〜5個（末尾）、日記風絵文字多め✨🚗💫
-
-JSONのみ返してください：
-{{"zh":{{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."}},"en":{{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."}},"ru":{{"x":"...","fb":"...","tt":"...","xhs":"...","ig":"..."}}}}"""
-
-    raw = await call_gemini_text(prompt)
-    clean = raw.replace("```json", "").replace("```", "").strip()
-    return json.loads(clean)
-
-# ============================================================
-# 広告文をテキスト形式に整形
-# ============================================================
-def format_ads_as_text(ads: dict, car_info: str) -> str:
-    sns_labels = {
-        "x": "X (Twitter)",
-        "fb": "Facebook",
-        "tt": "TikTok",
-        "xhs": "小紅書 (RED)",
-        "ig": "Instagram"
+        ]
     }
-    
-    text = "=" * 50 + "\n"
-    text += "車広告文 自動生成\n"
-    text += f"生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-    text += "=" * 50 + "\n\n"
-    
-    text += "【車情報】\n"
-    text += car_info + "\n\n"
-    
-    for lang, flag, title in [("zh", "🇨🇳", "中国語"), ("en", "🇬🇧", "English"), ("ru", "🇷🇺", "Русский")]:
-        text += "=" * 50 + "\n"
-        text += f"{flag} {title}\n"
-        text += "=" * 50 + "\n\n"
-        for sns_id, label in sns_labels.items():
-            text += f"【{label}】\n"
-            text += ads[lang].get(sns_id, "") + "\n\n"
-    
-    return text
 
-# ============================================================
-# Googleドライブに保存
-# ============================================================
-def save_to_drive(image_bytes: bytes, ad_text: str, car_name: str):
-    service = get_drive_service()
-    
-    # 日付_車種名でフォルダ作成
-    today = datetime.now().strftime("%Y-%m-%d")
-    folder_name = f"{today}_{car_name}"
-    
-    # フォルダ作成
-    folder_metadata = {
-        "name": folder_name,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [GDRIVE_FOLDER_ID]
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
     }
-    folder = service.files().create(body=folder_metadata, fields="id").execute()
-    folder_id = folder["id"]
-    
-    # 写真をアップロード
-    image_metadata = {
-        "name": "オークションシート.jpg",
-        "parents": [folder_id]
-    }
-    image_media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype="image/jpeg")
-    service.files().create(body=image_metadata, media_body=image_media, fields="id").execute()
-    
-    # 広告文テキストをアップロード
-    text_metadata = {
-        "name": "広告文.txt",
-        "parents": [folder_id]
-    }
-    text_media = MediaIoBaseUpload(
-        io.BytesIO(ad_text.encode("utf-8")),
-        mimetype="text/plain"
-    )
-    service.files().create(body=text_metadata, media_body=text_media, fields="id").execute()
-    
-    return folder_name
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(CLAUDE_API, headers=headers, json=payload)
+        print(f"Claude API: {r.status_code}")
+        data = r.json()
+        text = data["content"][0]["text"].strip()
+        # JSONフェンス除去
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        return json.loads(text.strip())
 
 # ============================================================
 # メイン処理
 # ============================================================
-async def process_image(chat_id: int, file_id: str):
+SNS_NAMES = {"x": "X(Twitter)", "fb": "Facebook", "tt": "TikTok", "xhs": "小紅書", "ig": "Instagram"}
+LANG_NAMES = {"ja": "🇯🇵日本語", "zh": "🇨🇳中国語", "en": "🇬🇧English", "ru": "🇷🇺Русский", "fr": "🇫🇷Français"}
+
+async def process_photos(chat_id: int, file_ids: list):
     try:
-        # 画像ダウンロード
-        file_url = await get_file_url(file_id)
-        image_bytes = await download_file(file_url)
+        await send_message(chat_id, f"📷 {len(file_ids)}枚受信\n🔍 車情報を解析中... (約30秒)")
+
+        # 最初の写真（オークションシート）を使用
+        url = await get_file_url(file_ids[0])
+        image_bytes = await download_image(url)
         print(f"Image size: {len(image_bytes)} bytes")
 
-        # 車情報抽出
-        car_info = await extract_car_info(image_bytes)
-        print(f"Car info: {car_info[:100]}")
+        # 広告生成
+        ads = await generate_ads(image_bytes)
 
-        # 車種名取得（フォルダ名用）
-        car_name = await get_car_name(car_info)
-        print(f"Car name: {car_name}")
+        # Google Driveに保存
+        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder_name = f"car_ad_{now}"
 
-        # 広告文生成
-        ads = await generate_ads(car_info)
+        try:
+            drive = get_drive_service()
+            sub_folder_id = create_drive_folder(drive, folder_name, GDRIVE_FOLDER_ID)
 
-        # テキスト整形
-        ad_text = format_ads_as_text(ads, car_info)
+            # 言語ごとにテキストファイル保存
+            for lang_code, lang_name in LANG_NAMES.items():
+                if lang_code not in ads:
+                    continue
+                content = f"=== {lang_name} ===\n\n"
+                for sns_code, sns_name in SNS_NAMES.items():
+                    if sns_code in ads[lang_code]:
+                        content += f"【{sns_name}】\n{ads[lang_code][sns_code]}\n\n"
+                upload_text_to_drive(drive, sub_folder_id, f"{lang_code}_{now}.txt", content)
 
-        # Googleドライブに保存
-        folder_name = await asyncio.get_event_loop().run_in_executor(
-            None, save_to_drive, image_bytes, ad_text, car_name
+            drive_saved = True
+        except Exception as e:
+            print(f"Drive error: {e}")
+            drive_saved = False
+
+        # 完了通知のみ送信（広告文は送らない）
+        drive_status = "✅ Google Driveに保存完了" if drive_saved else "⚠️ Drive保存失敗"
+        await send_message(
+            chat_id,
+            f"✅ 広告生成完了！\n"
+            f"📁 フォルダ: {folder_name}\n"
+            f"🌐 5言語 × 5SNS = 25種類\n"
+            f"{drive_status}"
         )
-
-        # Telegramに完了通知のみ送信
-        await send_message(chat_id, f"✅ 完了しました！\n\n📁 Googleドライブに保存：\n{folder_name}")
 
     except Exception as e:
         print(f"Error: {e}")
-        await send_message(chat_id, f"❌ エラーが発生しました。\n{str(e)}\n\n写真を再送してください。")
+        await send_message(chat_id, f"❌ エラー: {str(e)}\n写真を再送してください。")
+    finally:
+        user_buffers.pop(chat_id, None)
+        user_timers.pop(chat_id, None)
+
+async def delayed_process(chat_id: int):
+    await asyncio.sleep(5)
+    if chat_id in user_buffers and len(user_buffers[chat_id]) > 0:
+        file_ids = user_buffers[chat_id].copy()
+        await process_photos(chat_id, file_ids)
 
 # ============================================================
 # Webhook
@@ -298,33 +232,37 @@ async def webhook(request: Request):
     if not chat_id:
         return JSONResponse(content={"status": "ok"})
 
-    # 写真を受信
     if "photo" in message:
-        # 一番高解像度の写真を取得
-        photo = message["photo"][-1]
-        file_id = photo["file_id"]
+        file_id = message["photo"][-1]["file_id"]
 
-        await send_message(chat_id, "📋 オークションシートを受信しました！\n\n🔍 車情報を解析中...\n⏳ 少々お待ちください（約30秒）")
+        if chat_id not in user_buffers:
+            user_buffers[chat_id] = []
+        user_buffers[chat_id].append(file_id)
 
-        asyncio.create_task(process_image(chat_id, file_id))
+        if chat_id in user_timers:
+            user_timers[chat_id].cancel()
 
-    # テキストを受信
+        timer = asyncio.create_task(delayed_process(chat_id))
+        user_timers[chat_id] = timer
+
     elif "text" in message:
-        text = message.get("text", "")
-        if text == "/start":
-            await send_message(chat_id,
+        text = message["text"].strip()
+        if text in ["/start", "/help"]:
+            await send_message(
+                chat_id,
                 "🚗 車広告自動生成Bot\n\n"
-                "オークションシートの写真を送ってください！\n\n"
-                "✅ 広告文を自動生成\n"
-                "✅ Googleドライブに自動保存\n"
-                "✅ 中国語・英語・ロシア語 × 5SNS\n\n"
-                "※仕入先・価格は自動で除外されます"
+                "オークションシートの写真を送るだけ！\n\n"
+                "【生成内容】\n"
+                "🇯🇵日本語 / 🇨🇳中国語 / 🇬🇧英語\n"
+                "🇷🇺ロシア語 / 🇫🇷フランス語\n"
+                "× X / Facebook / TikTok / 小紅書 / Instagram\n"
+                "= 25種類の広告文\n\n"
+                "✅ Google Driveに自動保存\n"
+                "※仕入先・価格は自動で除外"
             )
-        else:
-            await send_message(chat_id, "📷 オークションシートの写真を送ってください！")
 
     return JSONResponse(content={"status": "ok"})
 
 @app.get("/")
 async def health():
-    return {"status": "running", "service": "Telegram Car Ad Generator Bot"}
+    return {"status": "running", "service": "Telegram Car Ad Generator (Claude API)"}
