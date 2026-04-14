@@ -1,8 +1,8 @@
 """
 Telegram Bot - 車オークションシート自動広告生成
 Claude API (Anthropic) 使用
-- 複数写真（何枚でもOK）から自動でオークションシートを判別
-- フォルダ名: 日付_車名
+- フォルダ名: 日付_せり番号_車名 (例: 20260414_3047_スバル_インプレッサ)
+- 複数写真から自動でオークションシートを判別
 - 写真（全枚）もDriveに保存
 - Google Drive（共有ドライブ対応）
 """
@@ -31,8 +31,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
 CLAUDE_API = "https://api.anthropic.com/v1/messages"
 
-# 判別に使う最大枚数（多すぎるとトークン超過）
-MAX_IMAGES_FOR_DETECTION = 4
+MAX_IMAGES_FOR_DETECTION = 10
 
 user_buffers = {}
 user_timers = {}
@@ -67,9 +66,7 @@ def create_drive_folder(service, folder_name: str, parent_id: str) -> str:
         "parents": [parent_id]
     }
     folder = service.files().create(
-        body=meta,
-        fields="id",
-        supportsAllDrives=True
+        body=meta, fields="id", supportsAllDrives=True
     ).execute()
     print(f"[Drive] フォルダ作成: {folder_name} -> {folder['id']}")
     return folder["id"]
@@ -86,31 +83,12 @@ def upload_text_to_drive(service, folder_id: str, filename: str, content: str):
     print(f"[Drive] テキスト保存: {filename}")
 
 def upload_image_to_drive(service, folder_id: str, filename: str, image_bytes: bytes):
-    media = MediaIoBaseUpload(
-        io.BytesIO(image_bytes),
-        mimetype="image/jpeg"
-    )
+    media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype="image/jpeg")
     meta = {"name": filename, "parents": [folder_id]}
     service.files().create(
         body=meta, media_body=media, fields="id", supportsAllDrives=True
     ).execute()
     print(f"[Drive] 画像保存: {filename}")
-
-# ============================================================
-# 画像をリサイズして軽量化（トークン節約）
-# ============================================================
-def resize_image_for_detection(image_bytes: bytes, max_size: int = 512) -> bytes:
-    """
-    PIL不要・軽量化のため、jpegのまま返す
-    ※ Telegramが既にある程度圧縮しているのでそのまま使用
-    """
-    # 200KB超の場合は先頭バイトのみ使用（簡易サイズ制限）
-    # 実際はTelegramが圧縮済みのため通常不要
-    return image_bytes
-
-def compress_image_b64(image_bytes: bytes) -> str:
-    """判別用にbase64化（そのまま）"""
-    return base64.standard_b64encode(image_bytes).decode("utf-8")
 
 # ============================================================
 # Telegram API
@@ -136,22 +114,28 @@ async def download_image(url: str) -> bytes:
         return r.content
 
 # ============================================================
-# Step1: オークションシート判別（最大4枚に絞る）
+# Step1: オークションシート判別 + せり番号 + 車名 取得
 # ============================================================
-async def find_auction_sheet_and_car_name(images: list[bytes]) -> tuple[int, str]:
+def shrink_image_for_detection(image_bytes: bytes, max_bytes: int = 150_000) -> str:
     """
-    全画像の中からオークションシートを探す。
-    APIには最大MAX_IMAGES_FOR_DETECTION枚だけ送る。
-    戻り値: (元リスト内のindex, car_name)
+    判別APIに送る画像をbase64化。
+    PILなしで対応：Telegramは既に圧縮済みなので通常150KB以下。
+    万が一大きい場合はJPEGヘッダを保ちつつ先頭max_bytesだけ使う
+    （破損JPEGになるがClaudeはサムネイル相当で読める）。
     """
-    total = len(images)
+    data = image_bytes[:max_bytes] if len(image_bytes) > max_bytes else image_bytes
+    return base64.standard_b64encode(data).decode("utf-8")
 
-    # 候補インデックス: 全枚数がMAX以下ならそのまま、超える場合は先頭MAX枚
-    candidate_indices = list(range(min(total, MAX_IMAGES_FOR_DETECTION)))
+async def find_auction_sheet_info(images: list) -> tuple:
+    """
+    戻り値: (sheet_index, lot_number, car_name)
+    lot_number: 出品票の大きく印刷された4桁前後の番号
+    """
+    candidate_indices = list(range(min(len(images), MAX_IMAGES_FOR_DETECTION)))
 
     content = []
     for i in candidate_indices:
-        b64 = compress_image_b64(images[i])
+        b64 = shrink_image_for_detection(images[i])
         content.append({
             "type": "image",
             "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}
@@ -162,17 +146,18 @@ async def find_auction_sheet_and_car_name(images: list[bytes]) -> tuple[int, str
         "type": "text",
         "text": (
             f"There are {n} images (index 0 to {n-1}). "
-            "Find the Japanese car auction sheet (出品表/オークションシート). "
-            "It has a lot of Japanese text, inspection grade numbers, mileage, and vehicle condition marks. "
-            "Read the car name (メーカー＋車種, e.g. スバル インプレッサ) from that sheet. "
-            "Reply ONLY in this JSON format, no other text: "
-            '{"index": 0, "car_name": "スバル インプレッサ"}'
+            "Find the Japanese car auction sheet (JU/USS/TAA オークション出品申込書). "
+            "It has a large lot number (出品番号/せり番号) printed prominently in a box at the top - "
+            "this is typically a 3-5 digit number like 3047, 2171, 1258. "
+            "Also read the car name (メーカー＋車種) from the 車名欄. "
+            "Reply ONLY in this exact JSON format, no other text: "
+            '{"index": 0, "lot_number": "3047", "car_name": "スズキ ワゴンR"}'
         )
     })
 
     payload = {
         "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 60,
+        "max_tokens": 80,
         "messages": [{"role": "user", "content": content}]
     }
     headers = {
@@ -193,19 +178,19 @@ async def find_auction_sheet_and_car_name(images: list[bytes]) -> tuple[int, str
             if start >= 0 and end > start:
                 parsed = json.loads(raw[start:end])
                 local_idx = int(parsed.get("index", 0))
+                lot_number = str(parsed.get("lot_number", "0000")).strip()
                 car_name = str(parsed.get("car_name", "不明")).strip()
-                # candidate_indicesの中のlocal_idxを元のインデックスに変換
                 actual_idx = candidate_indices[min(local_idx, len(candidate_indices) - 1)]
-                return actual_idx, car_name
+                return actual_idx, lot_number, car_name
     except Exception as e:
         print(f"[Sheet detect] error: {e}")
         import traceback
         traceback.print_exc()
 
-    return 0, "不明"
+    return 0, "0000", "不明"
 
 # ============================================================
-# Step2: 広告文生成（シート1枚のみ送信）
+# Step2: 広告文生成（シート1枚のみ）
 # ============================================================
 async def generate_ads(image_bytes: bytes) -> dict:
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
@@ -281,11 +266,36 @@ PLATFORM RULES:
                     raw = p
                     break
 
+        # 最初の完全なJSONブロックだけを取り出す（2個目以降は無視）
         start = raw.find("{")
-        end = raw.rfind("}") + 1
-        if start >= 0 and end > start:
-            raw = raw[start:end]
-
+        if start >= 0:
+            raw = raw[start:]
+        # 括弧の深さを数えて最初のJSONが閉じた位置を探す
+        depth = 0
+        end_pos = -1
+        in_string = False
+        escape = False
+        for i, ch in enumerate(raw):
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"' and not escape:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end_pos = i + 1
+                    break
+        if end_pos > 0:
+            raw = raw[:end_pos]
         return json.loads(raw)
 
 # ============================================================
@@ -293,6 +303,12 @@ PLATFORM RULES:
 # ============================================================
 SNS_NAMES  = {"x": "X(Twitter)", "fb": "Facebook", "tt": "TikTok", "xhs": "小紅書", "ig": "Instagram"}
 LANG_NAMES = {"ja": "🇯🇵 日本語", "zh": "🇨🇳 中国語", "en": "🇬🇧 English", "ru": "🇷🇺 Русский", "fr": "🇫🇷 Français"}
+
+def safe_name(text: str) -> str:
+    """フォルダ名に使えない文字を置換"""
+    for ch in [" ", "　", "/", "\\", ":", "*", "?", '"', "<", ">", "|"]:
+        text = text.replace(ch, "_")
+    return text
 
 async def process_photos(chat_id: int, file_ids: list):
     try:
@@ -306,17 +322,16 @@ async def process_photos(chat_id: int, file_ids: list):
             images.append(img_bytes)
             print(f"Downloaded: {len(img_bytes)} bytes")
 
-        # オークションシート判別 + 車名取得
-        sheet_idx, car_name = await find_auction_sheet_and_car_name(images)
-        print(f"Sheet index: {sheet_idx}, Car name: {car_name}")
+        # シート判別 + せり番号 + 車名
+        sheet_idx, lot_number, car_name = await find_auction_sheet_info(images)
+        print(f"Sheet:{sheet_idx}, Lot:{lot_number}, Car:{car_name}")
 
-        # 広告生成（シート1枚だけ送信）
+        # 広告生成
         ads = await generate_ads(images[sheet_idx])
 
-        # フォルダ名
+        # フォルダ名: 日付_せり番号_車名
         date_str = datetime.now().strftime("%Y%m%d")
-        safe_car_name = car_name.replace(" ", "_").replace("/", "_").replace("　", "_")
-        folder_name = f"{date_str}_{safe_car_name}"
+        folder_name = f"{date_str}_{safe_name(lot_number)}_{safe_name(car_name)}"
 
         # ── Google Drive 保存 ──────────────────────────────
         drive_saved = False
@@ -334,16 +349,15 @@ async def process_photos(chat_id: int, file_ids: list):
 
             sub_folder_id = create_drive_folder(drive, folder_name, GDRIVE_FOLDER_ID)
 
-            # ① 写真を全枚保存（シートは先頭、車体写真は連番）
-            sheet_saved = False
+            # ① 写真を全枚保存
             car_num = 1
             for i, img_bytes in enumerate(images):
                 if i == sheet_idx:
-                    upload_image_to_drive(drive, sub_folder_id, "00_auction_sheet.jpg", img_bytes)
-                    sheet_saved = True
+                    fname = "00_auction_sheet.jpg"
                 else:
-                    upload_image_to_drive(drive, sub_folder_id, f"car_photo_{car_num:02d}.jpg", img_bytes)
+                    fname = f"car_photo_{car_num:02d}.jpg"
                     car_num += 1
+                upload_image_to_drive(drive, sub_folder_id, fname, img_bytes)
 
             # ② 広告テキストを言語ごとに保存
             for lang_code, lang_name in LANG_NAMES.items():
@@ -369,6 +383,7 @@ async def process_photos(chat_id: int, file_ids: list):
         await send_message(
             chat_id,
             f"✅ 広告生成完了！\n"
+            f"🏷 せり番号: {lot_number}\n"
             f"🚗 {car_name}\n"
             f"📁 {folder_name}\n"
             f"🌐 5言語 × 5SNS = 25種類\n"
@@ -389,7 +404,7 @@ async def process_photos(chat_id: int, file_ids: list):
         user_timers.pop(chat_id, None)
 
 async def delayed_process(chat_id: int):
-    await asyncio.sleep(5)
+    await asyncio.sleep(10)
     if chat_id in user_buffers and user_buffers[chat_id]:
         file_ids = user_buffers[chat_id].copy()
         await process_photos(chat_id, file_ids)
