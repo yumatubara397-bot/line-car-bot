@@ -215,7 +215,7 @@ PLATFORM RULES:
 
     payload = {
         "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 6000,
+        "max_tokens": 8192,
         "system": system_prompt,
         "messages": [
             {
