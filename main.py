@@ -239,27 +239,48 @@ async def generate_ads_combined(item_images: list, item_names: list) -> dict:
     """
     combined_title = " ＋ ".join(item_names)
 
-    system_prompt = """You are an expert B2B marketing copywriter specializing in used goods for corporate clients.
+    system_prompt = """You are a copywriter for a Japanese used goods exporter that ships mixed containers worldwide.
 
-TONE: Professional, trustworthy, factual. Emphasize reliability, value, and business efficiency.
-Use industry terminology appropriate for corporate procurement.
+CORE MESSAGE: The CAR is the main product. Electronics (PC/iPad/smartphone) are secondary items — introduce them casually as "we also carry these, interested?"
+Structure: Car takes 70-80% of the ad content. Electronics get a brief, friendly mention at the end.
 
 STRICT RULES (NEVER VIOLATE):
-1. NEVER mention price, cost, or any monetary values
+1. NEVER mention price, cost, or monetary values
 2. NEVER mention auction house, supplier, or acquisition source
 3. NEVER include VIN, chassis number, serial number, or license plate
-4. Return ONLY valid JSON — no markdown, no explanation
-5. Every ad MUST start with the combined product title provided
+4. NEVER use abstract business jargon: no "efficiency", "productivity", "streamline", "synergy", "optimize", "solution"
+5. Return ONLY valid JSON — no markdown, no explanation
+6. Hashtags MUST be product-specific ONLY: model names, car names, brand names, product categories
+   FORBIDDEN hashtags examples: #efficiency #businesssolution #productivity #B2B #corporate
+   ALLOWED hashtag examples: #NissanSerena #MacBookPro #iPhone15 #JDMcars #usedcar #中古車 #日産
+
+CONTENT STRUCTURE for each ad:
+PART 1 — CAR (main focus, 70-80% of content):
+  Write an engaging description using concrete specs from the auction sheet:
+  make/model, year, mileage, grade score, color, transmission, key equipment (navigation, sunroof, sliding doors, etc.)
+  Make the car sound appealing and trustworthy. This is the hero of the ad.
+
+PART 2 — ELECTRONICS (casual mention, 20-30% of content):
+  After the car description, add a brief friendly line introducing the other items.
+  Tone: "By the way, we also have..." / "あわせてご検討ください" / "同じコンテナに積み合わせできます"
+  For each electronic item, write 1-2 sentences focused on buyer BENEFIT (not specs):
+    PC example: "日本製の信頼性の高いノートPC。現地での再販需要も高い。"
+    iPhone example: "SIMフリーiPhone。カメラ品質と耐久性で喜ばれる一台。"
+    iPad example: "日本版iPad。様々な用途に使える万能デバイス。"
+  Keep this section SHORT and casual — it's a soft upsell, not a full ad.
+
+PART 3 — CLOSING (1 line):
+  Mention that all items ship together in one container (one shipment, one customs clearance).
 
 Required JSON format (ALL 5 languages, ALL 5 platforms):
 {"ja":{"x":"","fb":"","tt":"","xhs":"","ig":""},"zh":{"x":"","fb":"","tt":"","xhs":"","ig":""},"en":{"x":"","fb":"","tt":"","xhs":"","ig":""},"ru":{"x":"","fb":"","tt":"","xhs":"","ig":""},"fr":{"x":"","fb":"","tt":"","xhs":"","ig":""}}
 
 PLATFORM RULES:
-[x]   Start with combined title. 120 chars max + 3-5 hashtags. Sharp B2B hook.
-[fb]  Start with combined title. 250-450 chars + 3-5 hashtags. Professional, 2-3 paragraphs covering all products.
-[tt]  Start with combined title. 150-250 chars + 5-8 hashtags. Dynamic but professional.
-[xhs] ALWAYS Chinese regardless of language key. Start with combined title in Chinese. 250-400 chars + 5 Chinese #hashtags.
-[ig]  Start with combined title. 200-300 chars + 15-25 hashtags. Clean, professional aesthetic."""
+[x]   180 chars max. Lead with container concept + product names. 3-5 product-specific hashtags only.
+[fb]  400-600 chars. 3 paragraphs: (1) container concept, (2) each product specs, (3) shipping advantage. 3-5 hashtags.
+[tt]  200-320 chars. Energetic, concrete specs, container hook. 5-8 product hashtags only.
+[xhs] ALWAYS Chinese regardless of language key. 350-500 chars. Container concept + detailed specs + shipping merit. 5-8 Chinese product hashtags.
+[ig]  300-420 chars. Aspirational but concrete specs. 20-30 product/model hashtags only."""
 
     # 全商品の画像をまとめてメッセージに含める
     content = []
@@ -283,11 +304,14 @@ PLATFORM RULES:
     content.append({
         "type": "text",
         "text": (
-            f"Combined product listing title: {combined_title}\n"
-            f"Products in this listing:\n" + "\n".join(f"- {d}" for d in product_descriptions) + "\n\n"
-            "Create ONE unified advertisement that covers ALL products together. "
-            "Start every ad with the combined title. "
-            "Highlight how these products complement each other for corporate buyers. "
+            "Main product (CAR): " + next((d for d in product_descriptions if d.startswith("Car:")), "No car listed") + "\n"
+            "Secondary items: " + (", ".join(d for d in product_descriptions if not d.startswith("Car:")) or "none") + "\n\n"
+            "STRUCTURE:\n"
+            "1. CAR is the hero (70-80% of ad). Read ALL specs carefully from the auction sheet image and write an engaging description.\n"
+            "2. After the car, add a casual soft-sell line for the electronics: 'あわせてどうぞ' / 'Also available' / 'В том же контейнере' style.\n"
+            "   For each electronic: 1-2 sentences on buyer benefit only (no spec lists).\n"
+            "3. Close with one short line: all items ship together in one container.\n"
+            "Use only product-specific hashtags (model names, car names, brands). NO business jargon.\n"
             "Generate ads for all 5 languages × 5 platforms. Return ONLY the JSON object."
         )
     })
@@ -433,37 +457,73 @@ async def process_photos(chat_id: int, file_ids: list):
 
         ads = await generate_ads_combined(item_images, item_names)
 
-        # ── 商品ごとに別フォルダでDrive保存（同じ広告文を入れる） ──
-        results = []
-        for group in groups:
-            product_type  = group.get("type", "other")
-            item_name     = group.get("item_name", "不明")
-            lot_number    = group.get("lot_number", "")
-            emoji         = PRODUCT_EMOJI.get(product_type, "📦")
+        # ── フォルダ名: 日付_せり番号_車名＋PC名＋... ──────
+        # 車のせり番号と車名を先頭に、他商品名を＋でつなぐ
+        car_group = next((g for g in groups if g.get("type") == "car"), None)
+        lot_number = car_group.get("lot_number", "") if car_group else ""
+        car_name   = safe_name(car_group.get("item_name", "")) if car_group else ""
+        other_names = [safe_name(g.get("item_name", "")) for g in groups if g.get("type") != "car"]
 
-            try:
-                folder_name = "保存スキップ"
-                if drive_ok:
-                    folder_name = await save_to_drive(drive, group, images, ads, date_str)
+        if car_name and lot_number:
+            folder_name = f"{date_str}_{safe_name(lot_number)}_{car_name}"
+        elif car_name:
+            folder_name = f"{date_str}_{car_name}"
+        else:
+            folder_name = f"{date_str}"
 
-                lot_info = f" #{lot_number}" if lot_number else ""
-                results.append(f"{emoji} {item_name}{lot_info}\n   📁 {folder_name}")
+        if other_names:
+            folder_name += "＋" + "＋".join(other_names)
 
-            except Exception as e:
-                print(f"[Save error] {item_name}: {e}")
-                import traceback
-                traceback.print_exc()
-                results.append(f"{emoji} {item_name} → ❌ 保存エラー: {str(e)[:50]}")
+        print(f"Folder name: {folder_name}")
+
+        # ── 1つのフォルダに全写真＋広告文を保存 ──────────
+        drive_status = "⚠️ Drive保存失敗"
+        try:
+            if drive_ok:
+                sub_folder_id = create_drive_folder(drive, folder_name, GDRIVE_FOLDER_ID)
+
+                # 全写真を保存（シートは先頭、他は連番）
+                car_sheet_idx = car_group.get("sheet_idx") if car_group else None
+                if car_sheet_idx is not None and car_sheet_idx < len(images):
+                    upload_image_to_drive(drive, sub_folder_id, "00_auction_sheet.jpg", images[car_sheet_idx])
+
+                photo_num = 1
+                for i, img_bytes in enumerate(images):
+                    if i == car_sheet_idx:
+                        continue
+                    upload_image_to_drive(drive, sub_folder_id, f"photo_{photo_num:02d}.jpg", img_bytes)
+                    photo_num += 1
+
+                # 広告テキストを言語ごとに保存
+                for lang_code, lang_name in LANG_NAMES.items():
+                    if lang_code not in ads:
+                        continue
+                    lines = [f"=== {lang_name} ===\n"]
+                    for sns_code, sns_name in SNS_NAMES.items():
+                        txt = ads[lang_code].get(sns_code, "")
+                        if txt:
+                            lines.append(f"【{sns_name}】\n{txt}\n")
+                    upload_text_to_drive(drive, sub_folder_id, f"{lang_code}.txt", "\n".join(lines))
+
+                drive_status = "✅ Google Drive保存完了"
+        except Exception as e:
+            print(f"[Drive save error] {e}")
+            import traceback
+            traceback.print_exc()
+            drive_status = f"⚠️ Drive保存失敗\n{str(e)[:100]}"
 
         # 完了通知
-        drive_status = "✅ Google Drive保存完了" if drive_ok else "⚠️ Drive保存失敗"
-        result_text  = "\n".join(results)
+        items_summary = "\n".join(
+            f"{PRODUCT_EMOJI.get(g.get('type','other'), '📦')} {g.get('item_name','不明')}"
+            + (f" #{g.get('lot_number','')}" if g.get('lot_number') else "")
+            for g in groups
+        )
         await send_message(
             chat_id,
             f"✅ 広告生成完了！\n\n"
-            f"📢 {combined_title}\n\n"
-            f"{result_text}\n\n"
-            f"🌐 5言語×5SNS=25種類（全商品まとめ広告）\n"
+            f"{items_summary}\n\n"
+            f"📁 {folder_name}\n"
+            f"🌐 5言語×5SNS=25種類\n"
             f"{drive_status}"
         )
 
