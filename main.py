@@ -230,44 +230,73 @@ PRODUCT_PROMPTS = {
     ),
 }
 
-async def generate_ads(image_bytes: bytes, product_type: str) -> dict:
-    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-    product_context = PRODUCT_PROMPTS.get(product_type, PRODUCT_PROMPTS["other"])
+async def generate_ads_combined(item_images: list, item_names: list) -> dict:
+    """
+    複数商品の画像と名前を受け取り、全商品をまとめた1つの広告文を生成。
+    冒頭に「商品A＋商品B」形式でタイトルを入れる。
+    item_images: [(image_bytes, product_type), ...]
+    item_names:  ["日産 セレナ", "MacBook Pro", ...]
+    """
+    combined_title = " ＋ ".join(item_names)
 
     system_prompt = """You are an expert B2B marketing copywriter specializing in used goods for corporate clients.
 
 TONE: Professional, trustworthy, factual. Emphasize reliability, value, and business efficiency.
-Avoid casual language. Use industry terminology appropriate for corporate procurement.
+Use industry terminology appropriate for corporate procurement.
 
 STRICT RULES (NEVER VIOLATE):
 1. NEVER mention price, cost, or any monetary values
 2. NEVER mention auction house, supplier, or acquisition source
 3. NEVER include VIN, chassis number, serial number, or license plate
 4. Return ONLY valid JSON — no markdown, no explanation
+5. Every ad MUST start with the combined product title provided
 
 Required JSON format (ALL 5 languages, ALL 5 platforms):
 {"ja":{"x":"","fb":"","tt":"","xhs":"","ig":""},"zh":{"x":"","fb":"","tt":"","xhs":"","ig":""},"en":{"x":"","fb":"","tt":"","xhs":"","ig":""},"ru":{"x":"","fb":"","tt":"","xhs":"","ig":""},"fr":{"x":"","fb":"","tt":"","xhs":"","ig":""}}
 
 PLATFORM RULES:
-[x]   120 chars max + 3-5 hashtags. Sharp B2B hook.
-[fb]  250-400 chars + 3-5 hashtags. Professional tone, 2-3 paragraphs, key specs highlighted.
-[tt]  150-250 chars + 5-8 hashtags. Dynamic but professional, lead with value proposition.
-[xhs] ALWAYS Chinese regardless of language key. 250-400 chars + 5 Chinese #hashtags. Business lifestyle, quality focus.
-[ig]  200-300 chars + 15-25 hashtags. Clean, professional aesthetic."""
+[x]   Start with combined title. 120 chars max + 3-5 hashtags. Sharp B2B hook.
+[fb]  Start with combined title. 250-450 chars + 3-5 hashtags. Professional, 2-3 paragraphs covering all products.
+[tt]  Start with combined title. 150-250 chars + 5-8 hashtags. Dynamic but professional.
+[xhs] ALWAYS Chinese regardless of language key. Start with combined title in Chinese. 250-400 chars + 5 Chinese #hashtags.
+[ig]  Start with combined title. 200-300 chars + 15-25 hashtags. Clean, professional aesthetic."""
+
+    # 全商品の画像をまとめてメッセージに含める
+    content = []
+    for img_bytes, ptype in item_images:
+        b64 = base64.standard_b64encode(img_bytes).decode("utf-8")
+        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}})
+
+    product_descriptions = []
+    for (_, ptype), name in zip(item_images, item_names):
+        if ptype == "car":
+            product_descriptions.append(f"Car: {name} (read specs from auction sheet image)")
+        elif ptype == "pc":
+            product_descriptions.append(f"PC/Laptop: {name} (read specs from photo)")
+        elif ptype == "ipad":
+            product_descriptions.append(f"iPad/Tablet: {name} (read specs from photo)")
+        elif ptype == "smartphone":
+            product_descriptions.append(f"Smartphone: {name} (read specs from photo)")
+        else:
+            product_descriptions.append(f"Product: {name} (read details from photo)")
+
+    content.append({
+        "type": "text",
+        "text": (
+            f"Combined product listing title: {combined_title}\n"
+            f"Products in this listing:\n" + "\n".join(f"- {d}" for d in product_descriptions) + "\n\n"
+            "Create ONE unified advertisement that covers ALL products together. "
+            "Start every ad with the combined title. "
+            "Highlight how these products complement each other for corporate buyers. "
+            "Generate ads for all 5 languages × 5 platforms. Return ONLY the JSON object."
+        )
+    })
 
     payload = {
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 8192,
         "system": system_prompt,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
-                    {"type": "text", "text": product_context + "Generate ads for all 5 languages × 5 platforms. Return ONLY the JSON object."}
-                ]
-            }
-        ]
+        "messages": [{"role": "user", "content": content}]
     }
 
     headers = {
@@ -276,9 +305,9 @@ PLATFORM RULES:
         "content-type": "application/json"
     }
 
-    async with httpx.AsyncClient(timeout=90) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(CLAUDE_API, headers=headers, json=payload)
-        print(f"Claude API [{product_type}]: {r.status_code}")
+        print(f"Claude API [combined]: {r.status_code}")
         data = r.json()
         raw = data["content"][0]["text"].strip()
         print(f"Raw response length: {len(raw)}")
@@ -360,7 +389,7 @@ async def process_photos(chat_id: int, file_ids: list):
             await send_message(chat_id, "❌ 商品を識別できませんでした。\n写真を再送してください。")
             return
 
-        await send_message(chat_id, f"✅ {len(groups)}商品を識別\n📝 広告文を生成中...")
+        await send_message(chat_id, f"✅ {len(groups)}商品を識別\n📝 まとめ広告を生成中...")
 
         # Driveサービス初期化
         drive_ok = False
@@ -374,21 +403,18 @@ async def process_photos(chat_id: int, file_ids: list):
             print(f"[Drive init] {e}")
 
         date_str = datetime.now().strftime("%Y%m%d")
-        results = []
 
-        # 商品ごとに広告生成 & 保存
-        for i, group in enumerate(groups):
+        # 全商品の「広告用画像」と「商品名」を収集
+        item_images = []  # [(image_bytes, product_type), ...]
+        item_names  = []  # ["日産 セレナ", "MacBook Pro", ...]
+
+        for group in groups:
             product_type = group.get("type", "other")
-            item_name = group.get("item_name", "不明")
-            lot_number = group.get("lot_number", "")
-            sheet_idx = group.get("sheet_idx")
+            item_name    = group.get("item_name", "不明")
+            sheet_idx    = group.get("sheet_idx")
             photo_indices = group.get("photo_indices", [])
-            emoji = PRODUCT_EMOJI.get(product_type, "📦")
 
-            print(f"[Group {i+1}] type={product_type}, item={item_name}, sheet={sheet_idx}, photos={photo_indices}")
-
-            # 広告生成に使う画像を決定
-            # 車はシート画像、それ以外は最初の写真
+            # 広告生成に使う代表画像（車はシート、他は最初の写真）
             if product_type == "car" and sheet_idx is not None and sheet_idx < len(images):
                 ad_image = images[sheet_idx]
             elif photo_indices and photo_indices[0] < len(images):
@@ -398,9 +424,24 @@ async def process_photos(chat_id: int, file_ids: list):
             else:
                 ad_image = images[0]
 
-            try:
-                ads = await generate_ads(ad_image, product_type)
+            item_images.append((ad_image, product_type))
+            item_names.append(item_name)
 
+        # ── 広告文は全商品まとめて1回だけ生成 ──────────────
+        combined_title = " ＋ ".join(item_names)
+        print(f"Combined title: {combined_title}")
+
+        ads = await generate_ads_combined(item_images, item_names)
+
+        # ── 商品ごとに別フォルダでDrive保存（同じ広告文を入れる） ──
+        results = []
+        for group in groups:
+            product_type  = group.get("type", "other")
+            item_name     = group.get("item_name", "不明")
+            lot_number    = group.get("lot_number", "")
+            emoji         = PRODUCT_EMOJI.get(product_type, "📦")
+
+            try:
                 folder_name = "保存スキップ"
                 if drive_ok:
                     folder_name = await save_to_drive(drive, group, images, ads, date_str)
@@ -409,19 +450,20 @@ async def process_photos(chat_id: int, file_ids: list):
                 results.append(f"{emoji} {item_name}{lot_info}\n   📁 {folder_name}")
 
             except Exception as e:
-                print(f"[Group {i+1}] error: {e}")
+                print(f"[Save error] {item_name}: {e}")
                 import traceback
                 traceback.print_exc()
-                results.append(f"{emoji} {item_name} → ❌ エラー: {str(e)[:50]}")
+                results.append(f"{emoji} {item_name} → ❌ 保存エラー: {str(e)[:50]}")
 
         # 完了通知
         drive_status = "✅ Google Drive保存完了" if drive_ok else "⚠️ Drive保存失敗"
-        result_text = "\n".join(results)
+        result_text  = "\n".join(results)
         await send_message(
             chat_id,
             f"✅ 広告生成完了！\n\n"
+            f"📢 {combined_title}\n\n"
             f"{result_text}\n\n"
-            f"🌐 各商品: 5言語×5SNS=25種類\n"
+            f"🌐 5言語×5SNS=25種類（全商品まとめ広告）\n"
             f"{drive_status}"
         )
 
